@@ -1,0 +1,27 @@
+name = "drakor"
+main = "index.js"
+compatibility_date = "2025-01-01"
+
+# D1 Database Binding
+[[d1_databases]]
+binding = "DB"
+database_name = "drakor"
+database_id = "d2a07b8c-a4b8-4eb0-aa50-748a26bf80b4"
+
+# Environment Variables (bisa juga via Cloudflare Dashboard)
+[vars]
+TMDB_API_KEY = "a5b0e465cd58eb1b5466e86e3a664450"
+JWT_SECRET = "fesstalefilmkuhh"
+R2_PUBLIC_URL ="drakor.gametebak.dpdns.org"
+SYLN_TOKEN = "syln_live_D2cDUuJqmlxkOGbzFn8NQqxx2-YuNyJY"
+BREVO_SENDER_ADDRESS = "fesstale@ngefilm.dpdns.org"
+TELEGRAM_BOT_TOKEN = "9057778639:AAG4Bm__G4BsIIkr6p5gASYkOy8cJeI80r4"
+SITE_URL = "https://ngefilm.dpdns.org"
+TELEGRAM_CLIENT_ID = "9057778639"
+TELEGRAM_CLIENT_SECRET = "k6wdTBr66PxxdQ6774JzZSKrQQ5EDjuiIJF8kwL3N2zDjN6h1-KJvw"
+TELEGRAM_REDIRECT_URI = "https://ngefilm.dpdns.org/api/auth/telegram/callback"
+TELEGRAM_WEBHOOK_SECRET= "fesstale_movie_secure_salt_2025_v2"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "fesstale-avatars"
