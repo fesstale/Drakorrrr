@@ -94,6 +94,11 @@ function jsonResponse(data, status = 200, headers = {}) {
         }
     });
 }
+// Tabel belum dibuat (schema.sql belum dijalankan) → pesan yang langsung menunjuk solusinya
+function dbHint(e) {
+    const msg = String((e && e.message) || e || '');
+    return /no such table/i.test(msg) ? 'Tabel database belum dibuat. Jalankan worker/schema.sql di D1 terlebih dahulu.' : msg;
+}
 function errorResponse(message, status = 400) { return jsonResponse({ success: false, error: message }, status); }
 function successResponse(data = null, message = 'Success', cacheControl = null) {
     const headers = {};
@@ -293,7 +298,7 @@ async function handleTelegramWebAppLogin(request, env) {
         if (!userString) return errorResponse('Data user tidak ditemukan', 400);
         const tgUser = JSON.parse(userString);
         let savedRef = null;
-        if (body.startParam && typeof body.startParam === 'string') {
+        if (body.startParam && typeof body.startParam === 'string' && !/^[a-z]_/i.test(body.startParam.trim())) {
             const sp = body.startParam.trim().toUpperCase();
             if (/^[A-Z0-9]{4,10}$/.test(sp)) savedRef = sp;
         }
@@ -311,7 +316,7 @@ async function handleTelegramWebAppLogin(request, env) {
         return successResponse(result, result.isNew ? 'Akun Telegram berhasil dibuat! 🎉' : 'Login Telegram berhasil!');
     } catch (e) {
         console.error('handleTelegramWebAppLogin error:', e);
-        return errorResponse('Gagal login Telegram Mini App: ' + e.message, 500);
+        return errorResponse('Gagal login Telegram Mini App: ' + dbHint(e), 500);
     }
 }
 
@@ -451,15 +456,23 @@ async function handleTelegramWebhook(request, env) {
         }
         let update;
         try { update = await request.json(); } catch (e) { return jsonResponse({ ok: true }); }
+        // Telegram Stars: konfirmasi sebelum pembayaran
+        if (update.pre_checkout_query) { await handleStarsPreCheckout(env, update.pre_checkout_query); return jsonResponse({ ok: true }); }
         const message = update.message || update.edited_message;
         if (!message || !message.chat) return jsonResponse({ ok: true });
         const chatId = message.chat.id;
+        // Telegram Stars: pembayaran berhasil -> tambahkan koin
+        if (message.successful_payment) { await handleStarsSuccessfulPayment(env, message); return jsonResponse({ ok: true }); }
         const text = (message.text || '').trim();
         const from = message.from || {};
         const telegramId = String(from.id || '');
         if (!telegramId) return jsonResponse({ ok: true });
         const user = await env.DB.prepare('SELECT * FROM users WHERE telegram_id = ?').bind(telegramId).first();
 
+        if (text.startsWith('/paysupport')) {
+            await sendTelegramMessage(env, chatId, '💬 *Bantuan pembayaran*\n\nAda masalah dengan top up Telegram Stars (koin belum masuk, salah beli)? Kirim pesan ke admin beserta waktu pembayaran dan username kamu. Kami akan memeriksanya.');
+            return jsonResponse({ ok: true });
+        }
         if (text.startsWith('/start')) {
             const parts = text.split(/\s+/);
             let refCode = parts[1] ? parts[1].trim() : null;
@@ -546,7 +559,7 @@ async function handleTelegramWebhook(request, env) {
             if (text === '/setup_webhook') {
                 const url = new URL(request.url);
                 const webhookUrl = `${url.origin}/api/telegram/webhook`;
-                const body = { url: webhookUrl, allowed_updates: ['message', 'edited_message'] };
+                const body = { url: webhookUrl, allowed_updates: ['message', 'edited_message', 'pre_checkout_query'] };
                 if (env.TELEGRAM_WEBHOOK_SECRET) body.secret_token = env.TELEGRAM_WEBHOOK_SECRET;
                 const res = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
                 const data = await res.json();
@@ -570,12 +583,12 @@ async function handleSetupTelegramWebhook(request, env, user) {
         if (!botToken) return errorResponse('TELEGRAM_BOT_TOKEN belum diset di environment', 500);
         const url = new URL(request.url);
         const webhookUrl = `${url.origin}/api/telegram/webhook`;
-        const body = { url: webhookUrl, allowed_updates: ['message', 'edited_message'] };
+        const body = { url: webhookUrl, allowed_updates: ['message', 'edited_message', 'pre_checkout_query'] };
         if (env.TELEGRAM_WEBHOOK_SECRET) body.secret_token = env.TELEGRAM_WEBHOOK_SECRET;
         const res = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const data = await res.json();
         return successResponse({ webhookUrl, telegramResponse: data }, data.ok ? 'Webhook berhasil diset' : 'Gagal set webhook');
-    } catch (e) { return errorResponse('Gagal: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
 }
 
 async function refreshSeriesStats(env, seriesId) {
@@ -671,30 +684,48 @@ async function verifyToken(env, token) {
 function isAdmin(user) { return user && user.role === 'admin'; }
 function isVipOrAdmin(user) { return user && (user.role === 'admin' || user.isVip); }
 
+// Pengaturan aplikasi dibaca SEKALI (satu query untuk semua kunci) lalu disimpan di memori isolate selama 60 detik.
+// Sebelumnya tiap kunci = satu query D1 (belasan query hanya untuk /api/notes).
+let _settingsCache = null, _settingsAt = 0, _settingsPromise = null, _settingsGen = 0;
+const SETTINGS_TTL_MS = 60000;
+function invalidateSettingsCache() { _settingsCache = null; _settingsPromise = null; _settingsGen++; }
+async function loadAppSettings(env) {
+    if (_settingsCache && Date.now() - _settingsAt < SETTINGS_TTL_MS) return _settingsCache;
+    if (!_settingsPromise) {
+        const gen = _settingsGen;
+        _settingsPromise = env.DB.prepare('SELECT key, value FROM app_settings').all().then((rows) => {
+            const map = {}; for (const r of (rows.results || [])) map[r.key] = r.value;
+            if (gen === _settingsGen) { _settingsCache = map; _settingsAt = Date.now(); _settingsPromise = null; }
+            return map;
+        }).catch((e) => { if (gen === _settingsGen) _settingsPromise = null; throw e; });
+    }
+    return _settingsPromise;
+}
 async function getAppSetting(env, key) {
-    try { const row = await env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind(key).first(); return row ? row.value : null; }
+    try { const map = await loadAppSettings(env); const v = map[key]; return v === undefined ? null : v; }
     catch (e) { return null; }
 }
+async function getAppSettingRow(env, key) { const value = await getAppSetting(env, key); return value === null ? null : { value }; }
 async function setAppSetting(env, key, value) {
-    try { await env.DB.prepare(`INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))`).bind(key, value).run(); return true; }
+    try { await env.DB.prepare(`INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))`).bind(key, value).run(); invalidateSettingsCache(); return true; }
     catch (e) { return false; }
 }
 
 async function getCustomTabs(env) {
-    try { const row = await env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('custom_tabs').first(); if (row && row.value) return JSON.parse(row.value); } catch (e) {}
+    try { const row = await getAppSettingRow(env, 'custom_tabs'); if (row && row.value) return JSON.parse(row.value); } catch (e) {}
     return [];
 }
 async function setCustomTabs(env, tabs) {
-    try { await env.DB.prepare(`INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))`).bind('custom_tabs', JSON.stringify(tabs)).run(); return true; }
+    try { await env.DB.prepare(`INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))`).bind('custom_tabs', JSON.stringify(tabs)).run(); invalidateSettingsCache(); return true; }
     catch (e) { return false; }
 }
 async function getAdSlots(env) {
-    try { const row = await env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('ad_slots').first(); if (row && row.value) return JSON.parse(row.value); } catch (e) {}
+    try { const row = await getAppSettingRow(env, 'ad_slots'); if (row && row.value) return JSON.parse(row.value); } catch (e) {}
     return { header: { enabled: false, code: '' }, home_top: { enabled: false, code: '' }, home_middle: { enabled: false, code: '' }, home_bottom: { enabled: false, code: '' }, player: { enabled: false, code: '' } };
 }
 async function getPlayerAds(env) {
     try {
-        const row = await env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('player_ads').first();
+        const row = await getAppSettingRow(env, 'player_ads');
         if (row && row.value) {
             const ads = JSON.parse(row.value);
             const now = new Date();
@@ -707,13 +738,13 @@ async function getPlayerAds(env) {
 async function checkDailyKoinLimit(env, userId) {
     try {
         const today = new Date().toISOString().split('T')[0];
-        const result = await env.DB.prepare(`SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type = 'earn' AND date(created_at) = ?`).bind(userId, today).first();
+        const result = await env.DB.prepare(`SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND type = 'earn' AND source != 'topup_stars' AND date(created_at) = ?`).bind(userId, today).first();
         const totalToday = result ? result.total : 0;
         return { totalToday, remaining: Math.max(0, CONFIG.MAX_DAILY_KOIN - totalToday), canEarn: totalToday < CONFIG.MAX_DAILY_KOIN };
     } catch (e) { return { totalToday: 0, remaining: CONFIG.MAX_DAILY_KOIN, canEarn: true }; }
 }
 async function checkDailyWatchLimit(env, userId, isVip) {
-    if (isVip) return { canWatch: true, used: 0, limit: null, extraUsed: 0, extraLimit: CONFIG.FREE_EXTRA_LIMIT, needsPayment: false, pricePerView: CONFIG.EXTRA_VIEW_PRICE };
+    if (isVip) return { canWatch: true, used: 0, limit: null, freeLimit: null, extraUsed: 0, extraLimit: CONFIG.FREE_EXTRA_LIMIT, needsPayment: false, pricePerView: CONFIG.EXTRA_VIEW_PRICE };
     try {
         const today = new Date().toISOString().split('T')[0];
         const result = await env.DB.prepare(`SELECT COUNT(*) as count FROM watch_history WHERE user_id = ? AND date(watched_at) = ?`).bind(userId, today).first();
@@ -731,7 +762,10 @@ async function handleLogout(request, env, user) {
 
 async function handleGetMe(request, env, user) {
     if (!user) return errorResponse('Tidak terautentikasi', 401);
-    const dbUser = await env.DB.prepare(
+    const today = new Date().toISOString().split('T')[0];
+    // Query di bawah tidak saling bergantung → dijalankan bersamaan (waktu tunggu = yang terlama, bukan jumlahnya)
+    const [dbUser, nextLevelExp, dailyWatch, koinLimit, checkin, giftRes, refRow, botUsername, follow] = await Promise.all([
+        env.DB.prepare(
         `SELECT id, username, display_name, email, role, is_vip, vip_expires_at, koin, level, exp,
          avatar_url, avatar_border_id, bubble_id, created_at, phone, telegram, telegram_id, notifications_enabled,
          bio, is_verified, verified_at, email_verified, username_changed_at, cover_url,
@@ -740,44 +774,37 @@ async function handleGetMe(request, env, user) {
          (SELECT scale FROM avatar_borders WHERE id = avatar_border_id) as border_scale,
          (SELECT level_url FROM levels WHERE level_number = level) as level_url
          FROM users WHERE id = ?`
-    ).bind(user.id).first();
+        ).bind(user.id).first(),
+        env.DB.prepare('SELECT exp_required, level_url FROM levels WHERE level_number > ? ORDER BY level_number ASC LIMIT 1').bind(user.level || 1).first(),
+        checkDailyWatchLimit(env, user.id, !!user.isVip),
+        checkDailyKoinLimit(env, user.id),
+        env.DB.prepare("SELECT id FROM missions WHERE user_id = ? AND mission_type = 'checkin' AND date(completed_at) = ?").bind(user.id, today).first().catch(() => null),
+        env.DB.prepare(
+            `SELECT ug.*, u.username as sender_username, u.display_name as sender_display_name, u.avatar_url as sender_avatar
+             FROM user_gifts ug JOIN users u ON ug.sender_id = u.id
+             WHERE ug.user_id = ? ORDER BY ug.created_at DESC LIMIT 30`
+        ).bind(user.id).all().catch(() => ({ results: [] })),
+        env.DB.prepare('SELECT referral_code, referred_by FROM users WHERE id = ?').bind(user.id).first().catch(() => null),
+        getAppSetting(env, 'telegram_bot_username'),
+        getFollowInfo(env, user.id, 0)
+    ]);
     if (!dbUser) return errorResponse('User tidak ditemukan', 404);
     let isVip = dbUser.is_vip === 1;
     if (isVip && dbUser.vip_expires_at && new Date(dbUser.vip_expires_at) < new Date()) isVip = false;
-    const nextLevelExp = await env.DB.prepare('SELECT exp_required, level_url FROM levels WHERE level_number > ? ORDER BY level_number ASC LIMIT 1').bind(dbUser.level).first();
-    const dailyWatch = await checkDailyWatchLimit(env, user.id, isVip);
-    const koinLimit = await checkDailyKoinLimit(env, user.id);
     let canChangeUsername = true, usernameChangeDaysRemaining = 0;
     if (dbUser.username_changed_at) {
         const lastChange = new Date(dbUser.username_changed_at);
         const nextAllowed = new Date(lastChange.getTime() + CONFIG.USERNAME_CHANGE_COOLDOWN_DAYS * 24 * 60 * 60 * 1000);
         if (nextAllowed > new Date()) { canChangeUsername = false; usernameChangeDaysRemaining = Math.ceil((nextAllowed - new Date()) / (24 * 60 * 60 * 1000)); }
     }
-    let hasCheckedInToday = false;
-    try {
-        const today = new Date().toISOString().split('T')[0];
-        const checkin = await env.DB.prepare("SELECT id FROM missions WHERE user_id = ? AND mission_type = 'checkin' AND date(completed_at) = ?").bind(user.id, today).first();
-        hasCheckedInToday = !!checkin;
-    } catch (e) {}
-    let giftsReceived = [];
-    try {
-        const gr = await env.DB.prepare(
-            `SELECT ug.*, u.username as sender_username, u.display_name as sender_display_name, u.avatar_url as sender_avatar
-             FROM user_gifts ug JOIN users u ON ug.sender_id = u.id
-             WHERE ug.user_id = ? ORDER BY ug.created_at DESC LIMIT 30`
-        ).bind(user.id).all();
-        giftsReceived = (gr.results || []).map(g => ({
+    const hasCheckedInToday = !!checkin;
+    const giftsReceived = ((giftRes && giftRes.results) || []).map(g => ({
             id: g.id, giftName: g.gift_name, giftUrl: g.gift_url, price: g.price, expReward: g.exp_reward,
             senderUsername: g.sender_username, senderDisplayName: g.sender_display_name, senderAvatar: g.sender_avatar, createdAtWIB: formatDateWIB(g.created_at)
         }));
-    } catch (e) {}
-    let referralCode = null, referredBy = null;
-    try {
-        referralCode = await ensureUserReferralCode(env, user.id);
-        const refRow = await env.DB.prepare('SELECT referred_by FROM users WHERE id = ?').bind(user.id).first();
-        if (refRow) referredBy = refRow.referred_by;
-    } catch (e) {}
-    const botUsername = await getAppSetting(env, 'telegram_bot_username');
+    let referralCode = refRow ? refRow.referral_code : null;
+    const referredBy = refRow ? refRow.referred_by : null;
+    if (!referralCode) { try { referralCode = await ensureUserReferralCode(env, user.id); } catch (e) {} }
     const referralLink = botUsername && referralCode ? `https://t.me/${botUsername}?startapp=${referralCode}` : null;
     return successResponse({
         id: dbUser.id, username: dbUser.username, displayName: dbUser.display_name || dbUser.username,
@@ -798,7 +825,8 @@ async function handleGetMe(request, env, user) {
         giftsReceived: giftsReceived, giftsCount: giftsReceived.length,
         referralCode: referralCode, referralLink: referralLink, referredBy: referredBy,
         telegramBotUsername: botUsername || null,
-        createdAt: dbUser.created_at, createdAtWIB: formatDateWIB(dbUser.created_at)
+        createdAt: dbUser.created_at, createdAtWIB: formatDateWIB(dbUser.created_at),
+        ...follow
     });
 }
 
@@ -852,7 +880,7 @@ async function handleApplyReferralCode(request, env, user) {
         await awardReferralStageBonus(env, referrer.id, user.id, 'register', CONFIG.REFERRAL_BONUS_REGISTER);
         await addReward(env, user.id, CONFIG.REFERRAL_BONUS_REGISTER, 0, 'referral_register_new');
         return successResponse({ newKoinBonus: CONFIG.REFERRAL_BONUS_REGISTER }, `Kode referral berhasil diterapkan! +${CONFIG.REFERRAL_BONUS_REGISTER} koin.`);
-    } catch (e) { return errorResponse('Gagal menerapkan kode referral: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal menerapkan kode referral: ' + dbHint(e), 500); }
 }
 
 // ============================================================
@@ -922,7 +950,9 @@ async function handleGetUserProfile(request, env, username, viewerUser) {
             totalComments: totalComments ? totalComments.count : 0,
             totalLikes: totalLikes ? totalLikes.count : 0,
             gallery, galleryCount: gallery.length,
-            giftsReceived, giftsCount: giftsReceived.length
+            giftsReceived, giftsCount: giftsReceived.length,
+            couple: await getPublicCoupleInfo(env, user.id),
+            ...(await getFollowInfo(env, user.id, viewerUser ? viewerUser.id : 0))
         });
     } catch (e) { return errorResponse('Gagal mengambil profil user', 500); }
 }
@@ -1202,7 +1232,7 @@ async function handleWatchEpisode(request, env, user, episodeId) {
             playerAds, showAds: !isVip, dailyWatch, needsPayment: totalCoinCost > 0, totalCost: totalCoinCost,
             isVipUser: isVip, locked: isLocked
         });
-    } catch (e) { return errorResponse('Gagal memuat episode: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal memuat episode: ' + dbHint(e), 500); }
 }
 async function handlePayAndPlayEpisode(request, env, user, episodeId) {
     if (!user) return errorResponse('Login required', 401);
@@ -1247,7 +1277,7 @@ async function handlePayAndPlayEpisode(request, env, user, episodeId) {
             videoServers = all.filter(s => !s.isVip || isVip);
         }
         return successResponse({ newKoin: dbUserAfter ? dbUserAfter.koin : 0, dailyWatch: newDailyWatch, videoServers, playerAds }, 'Berhasil memulai pemutaran');
-    } catch (e) { return errorResponse('Gagal memproses pembayaran: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal memproses pembayaran: ' + dbHint(e), 500); }
 }
 async function handleGetDrakorRecommendations(request, env, seriesId) {
     try {
@@ -1305,7 +1335,7 @@ async function handleUploadGyazo(request, env, user) {
         const gyazoData = await gyazoRes.json();
         if (!gyazoData.url) return errorResponse('Gagal upload ke Gyazo: ' + (gyazoData.message || 'unknown'), 500);
         return successResponse({ url: gyazoData.url, thumbUrl: gyazoData.thumb_url || gyazoData.url, imageId: gyazoData.image_id || null }, 'Upload berhasil');
-    } catch (e) { return errorResponse('Gagal upload: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal upload: ' + dbHint(e), 500); }
 }
 
 async function handleWatchManualContent(request, env, user, contentId) {
@@ -1339,7 +1369,7 @@ async function handleWatchManualContent(request, env, user, contentId) {
             playerAds, showAds: !isVip, dailyWatch, needsPayment: totalCoinCost > 0, totalCost: totalCoinCost,
             isVipUser: isVip, locked: isLocked
         });
-    } catch (e) { return errorResponse('Gagal memuat konten: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal memuat konten: ' + dbHint(e), 500); }
 }
 async function handlePayAndPlayContent(request, env, user, contentId) {
     if (!user) return errorResponse('Login required', 401);
@@ -1381,7 +1411,7 @@ async function handlePayAndPlayContent(request, env, user, contentId) {
             videoServers = allServers.filter(s => !s.isVip || isVip);
         }
         return successResponse({ newKoin: dbUserAfter ? dbUserAfter.koin : 0, dailyWatch: newDailyWatch, videoServers, playerAds }, 'Berhasil memulai pemutaran');
-    } catch (e) { return errorResponse('Gagal memproses pembayaran: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal memproses pembayaran: ' + dbHint(e), 500); }
 }
 
 // ============================================================
@@ -1425,7 +1455,7 @@ async function handleAdminAddManualContent(request, env, user) {
         ).bind(title, description || '', posterUrl, rating || 0, duration || 0, subtitle || '', genreStr, videoServersJson, downloadFree || '', downloadPremium || '', type || 'free', price || 0, country || '', year || '', isFeatured ? 1 : 0).first();
         try { await notifyNewSeries(env, result.id); } catch (e) {}
         return successResponse(result, 'Series berhasil ditambahkan. ID Series: ' + result.id);
-    } catch (e) { return errorResponse('Gagal menambahkan series: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal menambahkan series: ' + dbHint(e), 500); }
 }
 async function handleAdminUpdateManualContent(request, env, user, contentId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -1453,7 +1483,7 @@ async function handleAdminUpdateManualContent(request, env, user, contentId) {
         values.push(contentId);
         await env.DB.prepare(`UPDATE manual_content SET ${updates.join(', ')} WHERE id = ?`).bind(...values).run();
         return successResponse(null, 'Series berhasil diperbarui');
-    } catch (e) { return errorResponse('Gagal memperbarui: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal memperbarui: ' + dbHint(e), 500); }
 }
 async function handleAdminDeleteManualContent(request, env, user, contentId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -1464,7 +1494,7 @@ async function handleAdminDeleteManualContent(request, env, user, contentId) {
         await env.DB.prepare('DELETE FROM reactions WHERE content_id = ?').bind(contentId).run();
         await env.DB.prepare('DELETE FROM manual_content WHERE id = ?').bind(contentId).run();
         return successResponse(null, 'Series & semua episode berhasil dihapus permanen');
-    } catch (e) { return errorResponse('Gagal menghapus: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal menghapus: ' + dbHint(e), 500); }
 }
 async function handleAdminGetEpisodes(request, env, user, seriesId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -1484,7 +1514,7 @@ async function handleAdminGetEpisodes(request, env, user, seriesId) {
         const episodes = await env.DB.prepare(query).bind(...params, limit, offset).all();
         const total = await env.DB.prepare(countQuery).bind(...params).first();
         return successResponse({ seriesId: series.id, seriesTitle: series.title, episodes: (episodes.results || []).map(e => ({ ...e, durationText: formatDuration(e.duration), createdAtWIB: formatDateWIB(e.created_at) })), total: total.count, page, totalPages: Math.ceil(total.count / limit) });
-    } catch (e) { return errorResponse('Gagal memuat episode: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal memuat episode: ' + dbHint(e), 500); }
 }
 async function handleAdminAddEpisode(request, env, user, seriesId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -1504,7 +1534,7 @@ async function handleAdminAddEpisode(request, env, user, seriesId) {
         await refreshSeriesStats(env, seriesId);
         try { await notifyNewEpisode(env, seriesId, episodeNumber); } catch (e) {}
         return successResponse(result, 'Episode ' + episodeNumber + ' berhasil ditambahkan');
-    } catch (e) { return errorResponse('Gagal menambah episode: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal menambah episode: ' + dbHint(e), 500); }
 }
 async function handleAdminUpdateEpisode(request, env, user, episodeId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -1530,7 +1560,7 @@ async function handleAdminUpdateEpisode(request, env, user, episodeId) {
         await env.DB.prepare(`UPDATE episodes SET ${updates.join(', ')} WHERE id = ?`).bind(...values).run();
         await refreshSeriesStats(env, ep.series_id);
         return successResponse(null, 'Episode berhasil diperbarui');
-    } catch (e) { return errorResponse('Gagal update episode: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal update episode: ' + dbHint(e), 500); }
 }
 async function handleAdminDeleteEpisode(request, env, user, episodeId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -1541,7 +1571,7 @@ async function handleAdminDeleteEpisode(request, env, user, episodeId) {
         await env.DB.prepare('DELETE FROM watch_history WHERE episode_id = ?').bind(episodeId).run();
         await refreshSeriesStats(env, ep.series_id);
         return successResponse(null, 'Episode berhasil dihapus');
-    } catch (e) { return errorResponse('Gagal hapus episode: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal hapus episode: ' + dbHint(e), 500); }
 }
 
 // ============================================================
@@ -1608,7 +1638,7 @@ async function handleAdminVerifyUser(request, env, user, targetUserId) {
         const { isVerified } = body;
         await env.DB.prepare("UPDATE users SET is_verified = ?, verified_at = CASE WHEN ? = 1 THEN datetime('now') ELSE NULL END, updated_at = datetime('now') WHERE id = ?").bind(isVerified ? 1 : 0, isVerified ? 1 : 0, targetUserId).run();
         return successResponse(null, isVerified ? 'User berhasil diverifikasi ✓' : 'Verifikasi user dicabut');
-    } catch (e) { return errorResponse('Gagal: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
 }
 async function handleAdminDeleteUser(request, env, user, targetUserId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -1647,7 +1677,7 @@ async function handleAdminDeleteUser(request, env, user, targetUserId) {
         try { await env.DB.prepare('UPDATE users SET referred_by = NULL WHERE referred_by = ?').bind(targetUserId).run(); } catch (e) {}
         await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(targetUserId).run();
         return successResponse(null, 'User berhasil dihapus permanen');
-    } catch (e) { return errorResponse('Gagal menghapus user: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal menghapus user: ' + dbHint(e), 500); }
 }
 async function handleAdminToggleBlockIp(request, env, user, userId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -1667,7 +1697,7 @@ async function handleAdminToggleBlockIp(request, env, user, userId) {
             await env.DB.prepare('UPDATE users SET is_blocked = 0 WHERE id = ?').bind(userId).run();
             return successResponse(null, 'IP ' + target.ip_address + ' berhasil di-unblock');
         }
-    } catch (e) { return errorResponse('Gagal: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
 }
 async function handleAdminGetBlockedIps(request, env, user) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -1681,7 +1711,7 @@ async function handleAdminGetBlockedIps(request, env, user) {
 async function handleAdminGetPlayerAds(request, env, user) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
     try {
-        const row = await env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('player_ads').first();
+        const row = await getAppSettingRow(env, 'player_ads');
         const ads = row && row.value ? JSON.parse(row.value) : [];
         const now = new Date();
         return successResponse({ ads: ads.map(ad => ({ ...ad, isExpired: ad.expiresAt ? new Date(ad.expiresAt) <= now : false })) });
@@ -1693,7 +1723,7 @@ async function handleAdminAddPlayerAd(request, env, user) {
         const body = await request.json();
         const { title, videoUrl, expiresAt, enabled } = body;
         if (!title || !videoUrl) return errorResponse('Judul dan URL video wajib diisi');
-        const row = await env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('player_ads').first();
+        const row = await getAppSettingRow(env, 'player_ads');
         let ads = row && row.value ? JSON.parse(row.value) : [];
         const newAd = { id: generateId(), title, videoUrl, expiresAt: expiresAt || null, enabled: enabled !== false, createdAt: new Date().toISOString() };
         ads.push(newAd);
@@ -1705,7 +1735,7 @@ async function handleAdminUpdatePlayerAd(request, env, user, adId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
     try {
         const body = await request.json();
-        const row = await env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('player_ads').first();
+        const row = await getAppSettingRow(env, 'player_ads');
         let ads = row && row.value ? JSON.parse(row.value) : [];
         const idx = ads.findIndex(a => a.id === adId);
         if (idx === -1) return errorResponse('Iklan tidak ditemukan', 404);
@@ -1720,7 +1750,7 @@ async function handleAdminUpdatePlayerAd(request, env, user, adId) {
 async function handleAdminDeletePlayerAd(request, env, user, adId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
     try {
-        const row = await env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('player_ads').first();
+        const row = await getAppSettingRow(env, 'player_ads');
         let ads = row && row.value ? JSON.parse(row.value) : [];
         ads = ads.filter(a => a.id !== adId);
         await env.DB.prepare(`INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))`).bind('player_ads', JSON.stringify(ads)).run();
@@ -1744,7 +1774,7 @@ async function handleAdminAddGift(request, env, user) {
         if (!name || !url) return errorResponse('Nama dan URL wajib diisi');
         const result = await env.DB.prepare(`INSERT INTO gifts (name, url, price, exp_reward, is_active, created_at) VALUES (?, ?, ?, ?, 1, datetime('now')) RETURNING *`).bind(name, url, price || 0, expReward || 0).first();
         return successResponse(result, 'Gift berhasil ditambahkan');
-    } catch (e) { return errorResponse('Gagal menambah gift: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal menambah gift: ' + dbHint(e), 500); }
 }
 async function handleAdminUpdateGift(request, env, user, giftId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -1798,7 +1828,7 @@ async function handleSendGift(request, env, user, giftId) {
         try { await notifyGiftReceived(env, targetUserId, user, gift); } catch (e) {}
         const dbUserAfter = await env.DB.prepare('SELECT koin FROM users WHERE id = ?').bind(user.id).first();
         return successResponse({ newKoin: dbUserAfter ? dbUserAfter.koin : 0, receiver: target.display_name || target.username, expGained: gift.exp_reward }, `Berhasil kirim ${gift.name}! +${gift.exp_reward} EXP`);
-    } catch (e) { return errorResponse('Gagal mengirim gift: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal mengirim gift: ' + dbHint(e), 500); }
 }
 async function handleGetUserGifts(request, env, username) {
     try {
@@ -1850,7 +1880,7 @@ async function handleCoinTransfer(request, env, user) {
             amount: amount,
             receiver: { username: receiver.username, displayName: receiver.display_name || receiver.username }
         }, `Berhasil transfer ${formatKoin(amount)} koin ke @${receiver.username}`);
-    } catch (e) { return errorResponse('Gagal transfer koin: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal transfer koin: ' + dbHint(e), 500); }
 }
 
 // ⭐ NEW v29: TELEGRAM CHANGE (berbayar 15.000 koin)
@@ -1869,7 +1899,7 @@ async function handleChangeTelegram(request, env, user) {
         await env.DB.prepare("INSERT INTO transactions (user_id, type, amount, source, created_at) VALUES (?, 'spend', ?, 'telegram_change', datetime('now'))").bind(user.id, CONFIG.TELEGRAM_CHANGE_COST).run();
         const updated = await env.DB.prepare('SELECT koin FROM users WHERE id = ?').bind(user.id).first();
         return successResponse({ newKoin: updated.koin, telegram: newTg }, `Username Telegram berhasil diganti menjadi @${newTg}`);
-    } catch (e) { return errorResponse('Gagal ganti Telegram: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal ganti Telegram: ' + dbHint(e), 500); }
 }
 
 // ============================================================
@@ -1940,7 +1970,7 @@ async function handleAdminAddBubble(request, env, user) {
         if (!name || !css || !html) return errorResponse('Nama, CSS, dan HTML wajib diisi');
         const result = await env.DB.prepare(`INSERT INTO bubbles (name, price, duration_days, css, html, is_active, created_at) VALUES (?, ?, ?, ?, ?, 1, datetime('now')) RETURNING *`).bind(name, price || 0, durationDays || 0, css, html).first();
         return successResponse(result, 'Bubble berhasil ditambahkan');
-    } catch (e) { return errorResponse('Gagal menambahkan bubble: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal menambahkan bubble: ' + dbHint(e), 500); }
 }
 async function handleAdminUpdateBubble(request, env, user, bubbleId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -2025,9 +2055,9 @@ async function handleGetNotes(request, env, user) {
         const playerAds = await getPlayerAds(env);
         const customTabs = await getCustomTabs(env);
         let promoBanners = [];
-        try { const pbRow = await env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('promo_banners').first(); if (pbRow && pbRow.value) promoBanners = JSON.parse(pbRow.value); } catch (e) {}
+        try { const pbRow = await getAppSettingRow(env, 'promo_banners'); if (pbRow && pbRow.value) promoBanners = JSON.parse(pbRow.value); } catch (e) {}
         let downloadAds = [];
-        try { const daRow = await env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('download_ads').first(); if (daRow && daRow.value) downloadAds = JSON.parse(daRow.value); } catch (e) {}
+        try { const daRow = await getAppSettingRow(env, 'download_ads'); if (daRow && daRow.value) downloadAds = JSON.parse(daRow.value); } catch (e) {}
         const promos = await env.DB.prepare('SELECT * FROM promos WHERE is_active = 1 AND (expires_at IS NULL OR expires_at > datetime("now"))').all();
         const gyazoConfig = {
             clientId: await getAppSetting(env, 'gyazo_client_id'),
@@ -2159,13 +2189,15 @@ async function handleGetGallery(request, env, user) {
                      (SELECT scale FROM avatar_borders WHERE id = u.avatar_border_id) as border_scale,
                      (SELECT level_url FROM levels WHERE level_number = u.level) as level_url,
                      (SELECT COUNT(*) FROM gallery_likes WHERE post_id = g.id) as likes_count,
-                     (SELECT COUNT(*) FROM gallery_saves WHERE post_id = g.id) as saves_count
+                     (SELECT COUNT(*) FROM gallery_saves WHERE post_id = g.id) as saves_count,
+                     (SELECT COUNT(*) FROM gallery_comments WHERE post_id = g.id AND is_deleted = 0) as comments_count
                      FROM gallery_posts g JOIN users u ON g.user_id = u.id`;
         let countQuery = `SELECT COUNT(*) as count FROM gallery_posts g`;
         let params = [];
         if (search) { query += ` WHERE g.description LIKE ?`; countQuery += ` WHERE g.description LIKE ?`; params.push(`%${search}%`); }
         query += ` ORDER BY g.created_at DESC LIMIT ? OFFSET ?`;
         const posts = await env.DB.prepare(query).bind(...params, limit, offset).all();
+        const followingSet = await getFollowingSet(env, user);
         const total = await env.DB.prepare(countQuery).bind(...params).first();
         return successResponse({
             posts: posts.results.map(p => {
@@ -2174,7 +2206,7 @@ async function handleGetGallery(request, env, user) {
                 const price = p.price || 0;
                 const isLocked = price > 0 && !isOwner && !isPurchased;
                 const mediaUrls = p.media_urls ? JSON.parse(p.media_urls) : (p.image_url ? [p.image_url] : []);
-                return { id: p.id, user_id: p.user_id, username: p.username, display_name: p.display_name, avatar_url: p.avatar_url, is_verified: p.is_verified === 1, avatar_border_id: p.avatar_border_id, level: p.level, border_url: p.border_url, border_scale: p.border_scale, level_url: p.level_url, image_url: p.image_url, mediaUrls, mediaCount: mediaUrls.length, description: p.description, price, purchase_count: p.purchase_count || 0, likes_count: p.likes_count || 0, saves_count: p.saves_count || 0, created_at: p.created_at, isOwner, isPurchased, locked: isLocked, userLiked: likedIds.includes(p.id), userSaved: savedIds.includes(p.id) };
+                return { id: p.id, user_id: p.user_id, username: p.username, display_name: p.display_name, avatar_url: p.avatar_url, is_verified: p.is_verified === 1, avatar_border_id: p.avatar_border_id, level: p.level, border_url: p.border_url, border_scale: p.border_scale, level_url: p.level_url, image_url: p.image_url, mediaUrls, mediaCount: mediaUrls.length, description: p.description, price, purchase_count: p.purchase_count || 0, likes_count: p.likes_count || 0, saves_count: p.saves_count || 0, comments_count: p.comments_count == null ? undefined : p.comments_count, created_at: p.created_at, isOwner, isPurchased, locked: isLocked, isFollowing: followingSet.has(p.user_id), userLiked: likedIds.includes(p.id), userSaved: savedIds.includes(p.id) };
             }),
             total: total.count, page, totalPages: Math.ceil(total.count / limit)
         });
@@ -2207,7 +2239,7 @@ async function handleGetGalleryDetail(request, env, user, postId) {
         const price = post.price || 0;
         const isLocked = price > 0 && !isOwner && !isPurchased;
         const mediaUrls = post.media_urls ? JSON.parse(post.media_urls) : (post.image_url ? [post.image_url] : []);
-        return successResponse({ post: { ...post, is_verified: post.is_verified === 1, price, mediaUrls, mediaCount: mediaUrls.length, purchase_count: post.purchase_count || 0, isOwner, isPurchased, locked: isLocked, userLiked, userSaved } });
+        return successResponse({ post: { ...post, is_verified: post.is_verified === 1, price, mediaUrls, mediaCount: mediaUrls.length, purchase_count: post.purchase_count || 0, isOwner, isPurchased, locked: isLocked, userLiked, userSaved, isFollowing: (await getFollowingSet(env, user)).has(post.user_id) } });
     } catch (e) { return errorResponse('Gagal mengambil post', 500); }
 }
 async function handleGetSavedGallery(request, env, user) {
@@ -2263,21 +2295,19 @@ async function handleUploadGallery(request, env, user) {
         if (description.length > CONFIG.GALLERY_CAPTION_MAX) return errorResponse(`Caption maksimal ${CONFIG.GALLERY_CAPTION_MAX} karakter`);
         const accessToken = await getAppSetting(env, 'gyazo_access_token');
         if (!accessToken) return errorResponse('Gyazo belum dikonfigurasi admin', 500);
-        const uploadedUrls = [];
-        for (const file of files) {
-            if (!file || file.size === 0) continue;
-            const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-            if (file.type && !allowedTypes.includes(file.type)) continue;
-            if (file.size > 8 * 1024 * 1024) continue;
+        // semua foto dikirim ke Gyazo BERSAMAAN (sebelumnya satu per satu); urutan foto tetap sesuai pilihan user
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+        const valid = files.filter(file => file && file.size > 0 && (!file.type || allowedTypes.includes(file.type)) && file.size <= 8 * 1024 * 1024);
+        const uploadedUrls = (await Promise.all(valid.map(async (file) => {
             const gyazoForm = new FormData();
             gyazoForm.append('access_token', accessToken);
             gyazoForm.append('imagedata', file);
             try {
                 const gyazoRes = await fetch('https://upload.gyazo.com/api/upload', { method: 'POST', body: gyazoForm });
                 const gyazoData = await gyazoRes.json();
-                if (gyazoData.url) uploadedUrls.push(gyazoData.url);
-            } catch (e) { console.error('Gyazo upload file error:', e); }
-        }
+                return gyazoData.url || null;
+            } catch (e) { console.error('Gyazo upload file error:', e); return null; }
+        }))).filter(Boolean);
         if (uploadedUrls.length === 0) return errorResponse('Gagal upload ke Gyazo');
         const firstUrl = uploadedUrls[0];
         const mediaJson = uploadedUrls.length > 1 ? JSON.stringify(uploadedUrls) : null;
@@ -2287,7 +2317,7 @@ async function handleUploadGallery(request, env, user) {
         await addReward(env, user.id, CONFIG.KOIN_GALLERY_UPLOAD, CONFIG.EXP_PER_GALLERY_UPLOAD * uploadedUrls.length, 'gallery_upload');
         const msg = price > 0 ? `Story berhasil diupload (${uploadedUrls.length} foto) & dijual seharga ${price} koin` : `Story berhasil diupload (${uploadedUrls.length} foto)`;
         return successResponse({ postId: result.id, mediaCount: uploadedUrls.length }, msg);
-    } catch (e) { return errorResponse('Gagal upload gambar: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal upload gambar: ' + dbHint(e), 500); }
 }
 async function handleGalleryAction(request, env, user, postId, action) {
     if (!user) return errorResponse('Login required', 401);
@@ -2326,7 +2356,7 @@ async function handleBuyGalleryPost(request, env, user, postId) {
         await env.DB.prepare('INSERT INTO transactions (user_id, type, amount, source, created_at) VALUES (?, ?, ?, ?, datetime("now"))').bind(post.user_id, 'earn', price, 'gallery_sell_' + postId).run();
         const dbUserAfter = await env.DB.prepare('SELECT koin FROM users WHERE id = ?').bind(user.id).first();
         return successResponse({ newKoin: dbUserAfter ? dbUserAfter.koin : 0 }, 'Berhasil membeli story!');
-    } catch (e) { return errorResponse('Gagal membeli: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal membeli: ' + dbHint(e), 500); }
 }
 async function handleAdminDeleteGalleryPost(request, env, user, postId) {
     if (!isAdmin(user)) return errorResponse('Akses ditolak. Hanya admin.', 403);
@@ -2425,7 +2455,7 @@ async function handleAddGalleryComment(request, env, user, postId) {
         if (parentOwnerId && parentOwnerId !== user.id) { try { await notifyCommentReply(env, parentOwnerId, user, postTitle, post.id, true, post.id); } catch (e) {} }
         if (post.user_id !== user.id && post.user_id !== parentOwnerId) { try { await notifyCommentReply(env, post.user_id, user, postTitle, post.id, true, post.id); } catch (e) {} }
         return successResponse(null, 'Komentar berhasil ditambahkan');
-    } catch (e) { return errorResponse('Gagal menambahkan komentar: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal menambahkan komentar: ' + dbHint(e), 500); }
 }
 async function handleEditGalleryComment(request, env, user, commentId) {
     if (!user) return errorResponse('Tidak terautentikasi', 401);
@@ -2946,7 +2976,7 @@ async function handleUpdateProfile(request, env, user) {
             } catch (e) {}
         }
         return successResponse(null, 'Profil berhasil diperbarui');
-    } catch (e) { return errorResponse('Gagal memperbarui profil: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal memperbarui profil: ' + dbHint(e), 500); }
 }
 async function handleResetUsernameCooldown(request, env, user) {
     if (!user) return errorResponse('Login required', 401);
@@ -2958,7 +2988,7 @@ async function handleResetUsernameCooldown(request, env, user) {
         await env.DB.prepare('UPDATE users SET koin = koin - ?, username_changed_at = NULL, updated_at = datetime("now") WHERE id = ?').bind(COST, user.id).run();
         await env.DB.prepare('INSERT INTO transactions (user_id, type, amount, source, created_at) VALUES (?, ?, ?, ?, datetime("now"))').bind(user.id, 'spend', COST, 'username_reset').run();
         return successResponse(null, 'Cooldown username di-reset!');
-    } catch (e) { return errorResponse('Gagal reset: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal reset: ' + dbHint(e), 500); }
 }
 async function uploadToGyazoHelper(env, file) {
     const accessToken = await getAppSetting(env, 'gyazo_access_token');
@@ -2986,7 +3016,7 @@ async function handleUploadAvatar(request, env, user) {
         catch (err) { return errorResponse(err.message, 500); }
         await env.DB.prepare('UPDATE users SET avatar_url = ?, updated_at = datetime("now") WHERE id = ?').bind(publicUrl, user.id).run();
         return successResponse({ avatarUrl: publicUrl }, 'Foto profil berhasil diupload');
-    } catch (e) { return errorResponse('Gagal upload: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal upload: ' + dbHint(e), 500); }
 }
 async function handleUploadCover(request, env, user) {
     if (!user) return errorResponse('Tidak terautentikasi', 401);
@@ -3003,7 +3033,7 @@ async function handleUploadCover(request, env, user) {
         catch (err) { return errorResponse(err.message, 500); }
         await env.DB.prepare('UPDATE users SET cover_url = ?, updated_at = datetime("now") WHERE id = ?').bind(publicUrl, user.id).run();
         return successResponse({ coverUrl: publicUrl }, 'Foto sampul berhasil diupload');
-    } catch (e) { return errorResponse('Gagal upload: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal upload: ' + dbHint(e), 500); }
 }
 
 // ============================================================
@@ -3030,7 +3060,7 @@ async function handleCreateParty(request, env, user) {
         await env.DB.prepare('INSERT INTO party_room_state (room_id, current_time, is_playing, action_seq) VALUES (?, 0, 1, 0)').bind(result.id).run();
         await env.DB.prepare('INSERT OR IGNORE INTO party_room_members (room_id, user_id) VALUES (?, ?)').bind(result.id, user.id).run();
         return successResponse({ id: result.id, code: result.code, visibility: roomVisibility }, 'Room berhasil dibuat!');
-    } catch (e) { return errorResponse('Gagal: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
 }
 async function handleListPartyRooms(request, env, user) {
     try {
@@ -3042,7 +3072,7 @@ async function handleListPartyRooms(request, env, user) {
              ORDER BY r.created_at DESC LIMIT 50`
         ).all();
         return successResponse({ rooms: rooms.results || [] });
-    } catch (e) { return errorResponse('Gagal: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
 }
 async function handleJoinParty(request, env, user, code) {
     if (!user) return errorResponse('Login required', 401);
@@ -3053,7 +3083,7 @@ async function handleJoinParty(request, env, user, code) {
         await env.DB.prepare('INSERT OR IGNORE INTO party_room_members (room_id, user_id) VALUES (?, ?)').bind(room.id, user.id).run();
         await env.DB.prepare("UPDATE party_room_members SET last_ping = datetime('now') WHERE room_id = ? AND user_id = ?").bind(room.id, user.id).run();
         return successResponse({ roomId: room.id, code: room.code });
-    } catch (e) { return errorResponse('Gagal: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
 }
 async function handleGetPartyState(request, env, user, code) {
     if (!user) return errorResponse('Login required', 401);
@@ -3069,9 +3099,11 @@ async function handleGetPartyState(request, env, user, code) {
             const isMember = await env.DB.prepare('SELECT id FROM party_room_members WHERE room_id = ? AND user_id = ?').bind(room.id, user.id).first();
             if (!isMember) return errorResponse('Room ini private. Join pakai kode terlebih dahulu.', 403);
         }
-        await env.DB.prepare("UPDATE party_room_members SET last_ping = datetime('now') WHERE room_id = ? AND user_id = ?").bind(room.id, user.id).run();
-        const state = await env.DB.prepare('SELECT * FROM party_room_state WHERE room_id = ?').bind(room.id).first();
-        const members = await env.DB.prepare(
+        // satu panggilan D1 untuk semuanya (dipanggil tiap 1,5 detik oleh tiap anggota room)
+        const [, stateRes, members, messages] = await env.DB.batch([
+            env.DB.prepare("UPDATE party_room_members SET last_ping = datetime('now') WHERE room_id = ? AND user_id = ?").bind(room.id, user.id),
+            env.DB.prepare('SELECT * FROM party_room_state WHERE room_id = ?').bind(room.id),
+            env.DB.prepare(
             `SELECT m.user_id, u.username, u.display_name, u.avatar_url, u.avatar_border_id, u.level,
              (SELECT url FROM avatar_borders WHERE id = u.avatar_border_id) as border_url,
              (SELECT scale FROM avatar_borders WHERE id = u.avatar_border_id) as border_scale,
@@ -3079,8 +3111,8 @@ async function handleGetPartyState(request, env, user, code) {
              FROM party_room_members m JOIN users u ON m.user_id = u.id
              WHERE m.room_id = ? AND (m.last_ping IS NULL OR m.last_ping > datetime('now', '-3 minutes'))
              ORDER BY m.joined_at ASC`
-        ).bind(room.id).all();
-        const messages = await env.DB.prepare(
+            ).bind(room.id),
+            env.DB.prepare(
             `SELECT pm.*, u.username, u.display_name, u.avatar_url, u.avatar_border_id, u.level, u.is_vip, u.role, u.is_verified,
              (SELECT url FROM avatar_borders WHERE id = u.avatar_border_id) as border_url,
              (SELECT scale FROM avatar_borders WHERE id = u.avatar_border_id) as border_scale,
@@ -3089,7 +3121,9 @@ async function handleGetPartyState(request, env, user, code) {
              (SELECT html FROM bubbles WHERE id = u.bubble_id) as bubble_html
              FROM party_room_messages pm JOIN users u ON pm.user_id = u.id
              WHERE pm.room_id = ? ORDER BY pm.created_at DESC LIMIT 60`
-        ).bind(room.id).all();
+            ).bind(room.id)
+        ]);
+        const state = (stateRes.results || [])[0] || null;
         return successResponse({
             room: { id: room.id, code: room.code, title: room.title, videoUrl: room.video_url, visibility: room.visibility || 'public', isHost, hostUsername: room.host_username, hostDisplayName: room.host_display_name },
             state: state || { current_time: 0, is_playing: 1, action_seq: 0 },
@@ -3103,7 +3137,7 @@ async function handleGetPartyState(request, env, user, code) {
                 content: m.content, createdAtWIB: formatDateWIB(m.created_at)
             }))
         });
-    } catch (e) { return errorResponse('Gagal: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
 }
 async function handlePartyControl(request, env, user, code) {
     if (!user) return errorResponse('Login required', 401);
@@ -3147,7 +3181,7 @@ async function handlePartyControl(request, env, user, code) {
             "UPDATE party_room_state SET current_time = ?, is_playing = ?, last_updated = datetime('now'), last_action_by = ?, action_seq = ? WHERE room_id = ?"
         ).bind(newTime, newPlaying, user.id, newSeq, room.id).run();
         return successResponse({ currentTime: newTime, isPlaying: newPlaying, actionSeq: newSeq });
-    } catch (e) { return errorResponse('Gagal: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
 }
 async function handlePartyChat(request, env, user, code) {
     if (!user) return errorResponse('Login required', 401);
@@ -3161,7 +3195,7 @@ async function handlePartyChat(request, env, user, code) {
         if (content.length > 500) return errorResponse('Maks 500 karakter');
         await env.DB.prepare('INSERT INTO party_room_messages (room_id, user_id, content) VALUES (?, ?, ?)').bind(room.id, user.id, content).run();
         return successResponse(null, 'OK');
-    } catch (e) { return errorResponse('Gagal: ' + e.message, 500); }
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
 }
 async function handleLeaveParty(request, env, user, code) {
     if (!user) return errorResponse('Login required', 401);
@@ -3234,6 +3268,790 @@ async function verifyTurnstile(env, token, ip) {
 // ============================================================
 // ROUTER
 // ============================================================
+// ============================================================
+// PENCARIAN USER (header: pilih Series / User)
+// ============================================================
+async function handleSearchUsers(request, env, user) {
+    if (!user) return errorResponse('Login untuk mencari user', 401);
+    try {
+        const url = new URL(request.url);
+        const q = (url.searchParams.get('q') || '').trim().replace(/^@/, '').replace(/[%_]/g, '');
+        const page = Math.max(1, parseInt(url.searchParams.get('page') || '1'));
+        const limit = 20, offset = (page - 1) * limit;
+        if (q.length < 2) return successResponse({ users: [], total: 0, page, totalPages: 0 });
+        const like = '%' + q + '%';
+        const rows = await env.DB.prepare(
+            `SELECT u.id, u.username, u.display_name, u.role, u.is_vip, u.vip_expires_at, u.level, u.avatar_url, u.is_verified, u.bio,
+             (SELECT url FROM avatar_borders WHERE id = u.avatar_border_id) as border_url,
+             (SELECT scale FROM avatar_borders WHERE id = u.avatar_border_id) as border_scale,
+             (SELECT level_url FROM levels WHERE level_number = u.level) as level_url
+             FROM users u WHERE u.username LIKE ? OR u.display_name LIKE ?
+             ORDER BY (LOWER(u.username) = LOWER(?)) DESC, u.is_verified DESC, u.level DESC, u.id ASC LIMIT ? OFFSET ?`
+        ).bind(like, like, q, limit, offset).all();
+        const total = await env.DB.prepare('SELECT COUNT(*) as count FROM users WHERE username LIKE ? OR display_name LIKE ?').bind(like, like).first();
+        const count = total ? total.count : 0;
+        return successResponse({
+            users: (rows.results || []).map(u => ({
+                id: u.id, username: u.username, displayName: u.display_name || u.username, role: u.role,
+                isVip: u.is_vip === 1 && (!u.vip_expires_at || new Date(u.vip_expires_at) > new Date()),
+                level: u.level || 1, levelUrl: u.level_url, avatarUrl: u.avatar_url,
+                borderUrl: u.border_url, borderScale: u.border_scale || 1.2, isVerified: u.is_verified === 1, bio: u.bio || null
+            })),
+            total: count, page, totalPages: Math.ceil(count / limit)
+        });
+    } catch (e) { return errorResponse('Gagal mencari user', 500); }
+}
+
+// ============================================================
+// PASANGAN (ROOM PASANGAN) + STREAK HARIAN
+// Alur: buat room -> dapat kode -> pasangan masuk pakai kode -> status "active".
+// Streak +1 saat KEDUANYA check-in di hari yang sama (tanggal WIB).
+// Kalau ada 1 hari terlewat, streak kembali ke 0 dan mulai lagi dari 1.
+// ============================================================
+const COUPLE_DAY_LABELS = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
+function wibDateStr(offsetDays = 0) { return new Date(Date.now() + 7 * 3600 * 1000 + offsetDays * 86400000).toISOString().slice(0, 10); }
+function coupleEffectiveStreak(room) {
+    if (!room || !room.last_streak_date) return 0;
+    return (room.last_streak_date === wibDateStr(0) || room.last_streak_date === wibDateStr(-1)) ? (room.streak || 0) : 0;
+}
+function coupleDaysTogether(room) {
+    if (!room || !room.paired_at) return 0;
+    return Math.max(1, Math.floor((Date.now() - new Date(room.paired_at).getTime()) / 86400000) + 1);
+}
+function coupleDateText(iso) {
+    if (!iso) return '-';
+    try { return new Date(iso).toLocaleDateString('id-ID', { timeZone: 'Asia/Jakarta', day: 'numeric', month: 'short', year: 'numeric' }); } catch (e) { return '-'; }
+}
+async function getCurrentCoupleRoom(env, userId) {
+    return env.DB.prepare("SELECT * FROM couple_rooms WHERE (host_id = ? OR partner_id = ?) AND status IN ('waiting', 'active') ORDER BY id DESC LIMIT 1").bind(userId, userId).first();
+}
+// Kartu user (nama, avatar, border, level) jarang berubah → disimpan 60 detik di memori isolate
+const _cardCache = new Map();
+async function getCoupleUserCard(env, userId) {
+    if (!userId) return null;
+    const hit = _cardCache.get(userId), now = Date.now();
+    if (hit && now - hit.at < 60000) return hit.card ? { ...hit.card } : null;
+    const card = await loadUserCard(env, userId);
+    if (_cardCache.size > 1000) _cardCache.clear();
+    _cardCache.set(userId, { at: now, card });
+    return card ? { ...card } : null;
+}
+async function loadUserCard(env, userId) {
+    if (!userId) return null;
+    const u = await env.DB.prepare(
+        `SELECT id, username, display_name, avatar_url, level, is_verified,
+         (SELECT url FROM avatar_borders WHERE id = avatar_border_id) as border_url,
+         (SELECT scale FROM avatar_borders WHERE id = avatar_border_id) as border_scale,
+         (SELECT level_url FROM levels WHERE level_number = level) as level_url
+         FROM users WHERE id = ?`
+    ).bind(userId).first();
+    if (!u) return null;
+    return { id: u.id, username: u.username, displayName: u.display_name || u.username, avatarUrl: u.avatar_url, borderUrl: u.border_url, borderScale: u.border_scale || 1.2, level: u.level || 1, levelUrl: u.level_url, isVerified: u.is_verified === 1 };
+}
+async function buildCoupleState(env, room, viewerId, pre) {
+    if (!room) return null;
+    const today = wibDateStr(0);
+    const partnerId = room.host_id === viewerId ? room.partner_id : room.host_id;
+    const [me, partner, rows, game] = await Promise.all([
+        getCoupleUserCard(env, viewerId),
+        partnerId ? getCoupleUserCard(env, partnerId) : null,
+        pre ? { results: pre.checkins } : env.DB.prepare('SELECT user_id, checkin_date FROM couple_checkins WHERE room_id = ? AND checkin_date >= ?').bind(room.id, wibDateStr(-6)).all(),
+        pre ? rdSummaryFromRow(room, pre.game, viewerId) : rdSummaryForRoom(env, room, viewerId)
+    ]);
+    const has = (uid, date) => (rows.results || []).some(r => r.user_id === uid && r.checkin_date === date);
+    const week = [];
+    for (let i = -6; i <= 0; i++) {
+        const d = wibDateStr(i);
+        week.push({ date: d, label: COUPLE_DAY_LABELS[new Date(d + 'T00:00:00Z').getUTCDay()], me: has(viewerId, d), partner: partnerId ? has(partnerId, d) : false, isToday: i === 0 });
+    }
+    if (me) me.checkedInToday = has(viewerId, today);
+    if (partner) partner.checkedInToday = has(partnerId, today);
+    return {
+        game,
+        id: room.id, code: room.code, status: room.status, isHost: room.host_id === viewerId,
+        streak: coupleEffectiveStreak(room), bestStreak: room.best_streak || 0, lastStreakDate: room.last_streak_date,
+        daysTogether: coupleDaysTogether(room), pairedAt: room.paired_at, pairedAtText: coupleDateText(room.paired_at),
+        today, me, partner,
+        bothCheckedInToday: !!(me && partner && me.checkedInToday && partner.checkedInToday),
+        canCheckin: room.status === 'active' && !!me && !me.checkedInToday, week
+    };
+}
+async function notifyCoupleUser(env, userId, text) {
+    try {
+        const u = await env.DB.prepare('SELECT telegram_id, notifications_enabled FROM users WHERE id = ?').bind(userId).first();
+        if (u && u.telegram_id && u.notifications_enabled === 1) await sendTelegramMessage(env, u.telegram_id, text);
+    } catch (e) {}
+}
+function coupleSenderName(user) { return escapeMd(String(user.displayName || user.display_name || user.username || 'Pasanganmu')); }
+
+const COUPLE_ROOM_SUB = "(SELECT id FROM couple_rooms WHERE (host_id = ? OR partner_id = ?) AND status IN ('waiting', 'active') ORDER BY id DESC LIMIT 1)";
+async function handleGetCouple(request, env, user) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        // room + check-in 7 hari + game yang berjalan: satu panggilan D1 (halaman ini memanggilnya tiap 5 detik)
+        const [roomRes, checkinRes, gameRes] = await env.DB.batch([
+            env.DB.prepare("SELECT * FROM couple_rooms WHERE (host_id = ? OR partner_id = ?) AND status IN ('waiting', 'active') ORDER BY id DESC LIMIT 1").bind(user.id, user.id),
+            env.DB.prepare(`SELECT user_id, checkin_date FROM couple_checkins WHERE room_id = ${COUPLE_ROOM_SUB} AND checkin_date >= ?`).bind(user.id, user.id, wibDateStr(-6)),
+            env.DB.prepare(`SELECT id, status, mode, host_id, guest_joined FROM dice_games WHERE scope = 'couple' AND room_id = ${COUPLE_ROOM_SUB} AND status IN ${RD_ACTIVE} ORDER BY id DESC LIMIT 1`).bind(user.id, user.id)
+        ]);
+        const room = (roomRes.results || [])[0] || null;
+        return successResponse({ couple: await buildCoupleState(env, room, user.id, { checkins: checkinRes.results || [], game: (gameRes.results || [])[0] || null }) });
+    } catch (e) { return errorResponse('Gagal memuat data pasangan: ' + dbHint(e), 500); }
+}
+async function handleCreateCouple(request, env, user) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const existing = await getCurrentCoupleRoom(env, user.id);
+        if (existing && existing.status === 'active') return errorResponse('Kamu sudah punya pasangan. Akhiri dulu hubungan yang sekarang.', 400);
+        if (existing) return successResponse({ couple: await buildCoupleState(env, existing, user.id) }, 'Room pasanganmu masih menunggu. Bagikan kodenya!');
+        let code = null;
+        for (let i = 0; i < 10; i++) {
+            const c = generatePartyCode();
+            const dup = await env.DB.prepare('SELECT id FROM couple_rooms WHERE code = ?').bind(c).first();
+            if (!dup) { code = c; break; }
+        }
+        if (!code) return errorResponse('Gagal membuat kode, coba lagi');
+        const room = await env.DB.prepare("INSERT INTO couple_rooms (code, host_id, status, streak, best_streak, created_at) VALUES (?, ?, 'waiting', 0, 0, ?) RETURNING *").bind(code, user.id, new Date().toISOString()).first();
+        return successResponse({ couple: await buildCoupleState(env, room, user.id) }, 'Room pasangan dibuat! Bagikan kodenya ke doi 💌');
+    } catch (e) { return errorResponse('Gagal membuat room pasangan: ' + dbHint(e), 500); }
+}
+async function handleJoinCouple(request, env, user) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        let body = {};
+        try { body = await request.json(); } catch (e) {}
+        const code = String(body.code || '').trim().toUpperCase();
+        if (!code) return errorResponse('Kode room wajib diisi');
+        const room = await env.DB.prepare("SELECT * FROM couple_rooms WHERE code = ? AND status IN ('waiting', 'active')").bind(code).first();
+        if (!room) return errorResponse('Room pasangan tidak ditemukan atau sudah berakhir', 404);
+        if (room.host_id === user.id) return errorResponse('Ini room buatanmu sendiri. Bagikan kodenya ke pasanganmu.', 400);
+        if (room.status !== 'waiting' || room.partner_id) return errorResponse('Room ini sudah terisi pasangan lain', 400);
+        const mine = await getCurrentCoupleRoom(env, user.id);
+        if (mine && mine.status === 'active') return errorResponse('Kamu sudah punya pasangan. Akhiri dulu hubungan yang sekarang.', 400);
+        const now = new Date().toISOString();
+        const upd = await env.DB.prepare("UPDATE couple_rooms SET partner_id = ?, status = 'active', paired_at = ? WHERE id = ? AND status = 'waiting' AND partner_id IS NULL").bind(user.id, now, room.id).run();
+        if (upd && upd.meta && upd.meta.changes === 0) return errorResponse('Room ini sudah terisi pasangan lain', 400);
+        // room "menunggu" milik sendiri otomatis dibatalkan setelah berhasil masuk room pasangan
+        if (mine) await env.DB.prepare("UPDATE couple_rooms SET status = 'ended', ended_at = ? WHERE id = ? AND status = 'waiting'").bind(now, mine.id).run();
+        const fresh = await env.DB.prepare('SELECT * FROM couple_rooms WHERE id = ?').bind(room.id).first();
+        await notifyCoupleUser(env, room.host_id, `💞 *${coupleSenderName(user)}* masuk ke room pasanganmu! Kalian resmi berpasangan. Check-in tiap hari biar streak jalan 🔥`);
+        return successResponse({ couple: await buildCoupleState(env, fresh, user.id) }, 'Kalian resmi berpasangan 💞');
+    } catch (e) { return errorResponse('Gagal masuk room pasangan: ' + dbHint(e), 500); }
+}
+async function handleCoupleCheckin(request, env, user) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const room = await getCurrentCoupleRoom(env, user.id);
+        if (!room || room.status !== 'active') return errorResponse('Kamu belum punya pasangan. Buat atau masuk room pasangan dulu.', 400);
+        const today = wibDateStr(0), yesterday = wibDateStr(-1);
+        const already = await env.DB.prepare('SELECT id FROM couple_checkins WHERE room_id = ? AND user_id = ? AND checkin_date = ?').bind(room.id, user.id, today).first();
+        if (already) return errorResponse('Kamu sudah check-in hari ini 💖', 400);
+        await env.DB.prepare('INSERT OR IGNORE INTO couple_checkins (room_id, user_id, checkin_date, created_at) VALUES (?, ?, ?, ?)').bind(room.id, user.id, today, new Date().toISOString()).run();
+        const partnerId = room.host_id === user.id ? room.partner_id : room.host_id;
+        const partnerDone = await env.DB.prepare('SELECT id FROM couple_checkins WHERE room_id = ? AND user_id = ? AND checkin_date = ?').bind(room.id, partnerId, today).first();
+        let streakUp = false, message = 'Check-in berhasil! Sekarang giliran pasanganmu 💌';
+        if (partnerDone && room.last_streak_date !== today) {
+            const newStreak = room.last_streak_date === yesterday ? (room.streak || 0) + 1 : 1;
+            const best = Math.max(room.best_streak || 0, newStreak);
+            await env.DB.prepare('UPDATE couple_rooms SET streak = ?, best_streak = ?, last_streak_date = ? WHERE id = ? AND (last_streak_date IS NULL OR last_streak_date != ?)').bind(newStreak, best, today, room.id, today).run();
+            streakUp = true; message = `🔥 Streak kalian jadi ${newStreak} hari!`;
+            await notifyCoupleUser(env, partnerId, `🔥 *${coupleSenderName(user)}* juga sudah check-in. Streak kalian sekarang *${newStreak} hari*!`);
+        } else if (!partnerDone) {
+            await notifyCoupleUser(env, partnerId, `💌 *${coupleSenderName(user)}* sudah check-in hari ini. Giliranmu supaya streak bertambah!`);
+        }
+        const fresh = await env.DB.prepare('SELECT * FROM couple_rooms WHERE id = ?').bind(room.id).first();
+        return successResponse({ couple: await buildCoupleState(env, fresh, user.id), streakUp }, message);
+    } catch (e) { return errorResponse('Gagal check-in: ' + dbHint(e), 500); }
+}
+async function handleEndCouple(request, env, user) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const room = await getCurrentCoupleRoom(env, user.id);
+        if (!room) return errorResponse('Kamu tidak punya room pasangan', 404);
+        await env.DB.prepare("UPDATE couple_rooms SET status = 'ended', ended_at = ? WHERE id = ?").bind(new Date().toISOString(), room.id).run();
+        try { await env.DB.prepare("UPDATE dice_games SET status = 'cancelled', ended_ms = ? WHERE room_id = ? AND status IN ('lobby', 'picking', 'playing')").bind(Date.now(), room.id).run(); } catch (e) {}
+        if (room.status === 'active') {
+            const partnerId = room.host_id === user.id ? room.partner_id : room.host_id;
+            await notifyCoupleUser(env, partnerId, `💔 *${coupleSenderName(user)}* mengakhiri room pasangan kalian.`);
+        }
+        return successResponse(null, room.status === 'waiting' ? 'Room pasangan dibatalkan' : 'Hubungan diakhiri');
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
+}
+const coupleJoinCols = (alias, pfx) => `${alias}.username as ${pfx}_username, ${alias}.display_name as ${pfx}_display_name, ${alias}.avatar_url as ${pfx}_avatar_url, ${alias}.level as ${pfx}_level, ${alias}.is_verified as ${pfx}_is_verified,
+    (SELECT url FROM avatar_borders WHERE id = ${alias}.avatar_border_id) as ${pfx}_border_url,
+    (SELECT scale FROM avatar_borders WHERE id = ${alias}.avatar_border_id) as ${pfx}_border_scale`;
+const COUPLE_LB_SELECT = `SELECT r.*, CASE WHEN r.last_streak_date >= ? THEN r.streak ELSE 0 END as eff_streak, ${coupleJoinCols('h', 'h')}, ${coupleJoinCols('p', 'p')}
+    FROM couple_rooms r JOIN users h ON r.host_id = h.id JOIN users p ON r.partner_id = p.id WHERE r.status = 'active'`;
+function mapCoupleLbRow(r, rank, viewer) {
+    const card = (id, pfx) => ({ id, username: r[pfx + '_username'], displayName: r[pfx + '_display_name'] || r[pfx + '_username'], avatarUrl: r[pfx + '_avatar_url'], borderUrl: r[pfx + '_border_url'], borderScale: r[pfx + '_border_scale'] || 1.2, level: r[pfx + '_level'] || 1, isVerified: r[pfx + '_is_verified'] === 1 });
+    return { id: r.id, rank, streak: r.eff_streak || 0, bestStreak: r.best_streak || 0, daysTogether: coupleDaysTogether(r), isMine: !!viewer && (r.host_id === viewer.id || r.partner_id === viewer.id), a: card(r.host_id, 'h'), b: card(r.partner_id, 'p') };
+}
+// Rank streak pasangan (leaderboard kategori "streak")
+async function handleCoupleLeaderboard(request, env, user) {
+    try {
+        const url = new URL(request.url);
+        const page = Math.max(1, parseInt(url.searchParams.get('page') || '1'));
+        const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '20')));
+        const offset = (page - 1) * limit, yesterday = wibDateStr(-1);
+        const rows = await env.DB.prepare(COUPLE_LB_SELECT + ' ORDER BY eff_streak DESC, r.best_streak DESC, r.paired_at ASC LIMIT ? OFFSET ?').bind(yesterday, limit, offset).all();
+        const total = await env.DB.prepare("SELECT COUNT(*) as count FROM couple_rooms WHERE status = 'active'").first();
+        const count = total ? total.count : 0;
+        let myCouple = null;
+        if (user) {
+            const mine = await env.DB.prepare(COUPLE_LB_SELECT + ' AND (r.host_id = ? OR r.partner_id = ?) LIMIT 1').bind(yesterday, user.id, user.id).first();
+            if (mine) {
+                const eff = mine.eff_streak || 0, best = mine.best_streak || 0;
+                const ahead = await env.DB.prepare(
+                    `SELECT COUNT(*) as count FROM couple_rooms r WHERE r.status = 'active' AND r.id != ? AND (
+                        (CASE WHEN r.last_streak_date >= ? THEN r.streak ELSE 0 END) > ?
+                        OR ((CASE WHEN r.last_streak_date >= ? THEN r.streak ELSE 0 END) = ? AND (r.best_streak > ? OR (r.best_streak = ? AND r.paired_at < ?))))`
+                ).bind(mine.id, yesterday, eff, yesterday, eff, best, best, mine.paired_at).first();
+                myCouple = mapCoupleLbRow(mine, (ahead ? ahead.count : 0) + 1, user);
+            }
+        }
+        return successResponse({ couples: (rows.results || []).map((r, i) => mapCoupleLbRow(r, offset + i + 1, user)), total: count, page, totalPages: Math.ceil(count / limit), myCouple });
+    } catch (e) { return errorResponse('Gagal memuat rank streak: ' + dbHint(e), 500); }
+}
+// Info pasangan untuk profil publik ("Berpasangan dengan ...")
+async function getPublicCoupleInfo(env, userId) {
+    try {
+        const room = await env.DB.prepare("SELECT * FROM couple_rooms WHERE (host_id = ? OR partner_id = ?) AND status = 'active' ORDER BY id DESC LIMIT 1").bind(userId, userId).first();
+        if (!room) return null;
+        const partner = await getCoupleUserCard(env, room.host_id === userId ? room.partner_id : room.host_id);
+        if (!partner) return null;
+        return { streak: coupleEffectiveStreak(room), bestStreak: room.best_streak || 0, daysTogether: coupleDaysTogether(room), partner };
+    } catch (e) { return null; }
+}
+
+// ============================================================
+// RANDOM DICE
+// Dua cakupan: 'couple' (di Room Pasangan) dan 'global' (room berkode, siapa saja bisa masuk).
+// Simulasi berjalan di HP tiap pemain; server menjadi wasit & perantara:
+// lobi + 30 detik pilih dadu, status tiap pemain, chat, menang/kalah, hadiah.
+// Hadiah (menang saja): pasangan -> EXP; global mode Teman -> EXP; global mode Lawan -> trophy.
+// Trophy dicatat per musim (bulan kalender WIB), jadi otomatis kembali 0 tiap awal bulan.
+// ============================================================
+const RD_CFG = {
+    PICK_MS: 30000, READY_START_MS: 3000, STAGE_SEC: 9, START_DELAY: 3, FINAL_STAGE: 30,
+    STALE_MS: 25000, LOBBY_TTL_MS: 300000, MAX_GAME_MS: 1800000, RESULT_TTL_MS: 120000, MIN_VERSUS_MS: 60000,
+    WIN_EXP_VERSUS: 300, WIN_EXP_COOP: 250, WIN_EXP_SOLO: 150, WIN_TROPHIES: 30, LOSE_TROPHIES: 20, MAX_REWARDED_PER_DAY: 10, CHAT_MAX: 120
+};
+const RD_DICE_IDS = ['fire', 'electric', 'wind', 'poison', 'ice', 'iron', 'gamble', 'lock', 'crit', 'light', 'mine', 'typhoon', 'death', 'bomb', 'acid', 'growth', 'meteor', 'joker', 'magnet', 'arrow'];
+const RD_ACTIVE = "('lobby', 'picking', 'playing')";
+function rdParse(json) { try { return json ? JSON.parse(json) : null; } catch (e) { return null; } }
+function rdValidDeck(deck) { return Array.isArray(deck) && deck.length === 5 && new Set(deck).size === 5 && deck.every(d => RD_DICE_IDS.includes(d)); }
+function rdRandomDeck() {
+    const pool = RD_DICE_IDS.slice();
+    for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+    return pool.slice(0, 5);
+}
+// Status kiriman klien dibersihkan & dibatasi sebelum disimpan / diteruskan ke pemain lain
+function rdCleanState(st) {
+    if (!st || typeof st !== 'object') return null;
+    const b = Array.isArray(st.b) ? st.b.slice(0, 15).map(e => (Array.isArray(e) && RD_DICE_IDS.includes(e[0])) ? [e[0], Math.max(1, Math.min(7, e[1] | 0))] : 0) : [];
+    const p = {};
+    if (st.p && typeof st.p === 'object') for (const k of RD_DICE_IDS) if (st.p[k]) p[k] = Math.max(1, Math.min(5, st.p[k] | 0));
+    return { b, p, stage: Math.max(1, Math.min(999, st.stage | 0)), lives: Math.max(0, Math.min(3, st.lives | 0)), alive: st.alive !== false, cleared: st.cleared === true, sp: Math.max(0, Math.min(999999, st.sp | 0)), n: Math.max(0, Math.min(999, st.n | 0)), k: Math.max(0, Math.min(99999, st.k | 0)) };
+}
+// Musim trophy = bulan kalender WIB. Tidak perlu cron: bulan baru = kunci musim baru = mulai dari 0.
+function rdSeasonInfo() {
+    const today = wibDateStr(0); const y = Number(today.slice(0, 4)), m = Number(today.slice(5, 7)), d = Number(today.slice(8, 10));
+    const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    let label = today.slice(0, 7);
+    try { label = new Date(Date.UTC(y, m - 1, 1)).toLocaleDateString('id-ID', { month: 'long', year: 'numeric', timeZone: 'UTC' }); } catch (e) {}
+    return { season: today.slice(0, 7), seasonLabel: label, resetInDays: daysInMonth - d + 1 };
+}
+async function rdGetTrophies(env, userId) {
+    const row = await env.DB.prepare('SELECT trophies, wins FROM dice_trophies WHERE user_id = ? AND season = ?').bind(userId, rdSeasonInfo().season).first();
+    return { trophies: row ? row.trophies : 0, wins: row ? row.wins : 0 };
+}
+async function rdAddTrophies(env, userId, amount) {
+    await env.DB.prepare('INSERT INTO dice_trophies (user_id, season, trophies, wins) VALUES (?, ?, ?, 1) ON CONFLICT(user_id, season) DO UPDATE SET trophies = trophies + excluded.trophies, wins = wins + 1').bind(userId, rdSeasonInfo().season, amount).run();
+}
+// Kurangi trophy pihak yang kalah (tidak pernah di bawah 0). Mengembalikan jumlah yang benar-benar dikurangi.
+async function rdTakeTrophies(env, userId, amount) {
+    if (!userId || amount <= 0) return 0;
+    const season = rdSeasonInfo().season;
+    const row = await env.DB.prepare('SELECT trophies FROM dice_trophies WHERE user_id = ? AND season = ?').bind(userId, season).first();
+    const lost = Math.min(amount, row ? row.trophies : 0);
+    if (lost > 0) await env.DB.prepare('UPDATE dice_trophies SET trophies = MAX(0, trophies - ?) WHERE user_id = ? AND season = ?').bind(lost, userId, season).run();
+    return lost;
+}
+async function rdRewardedToday(env, userId) {
+    const dayStart = Date.parse(wibDateStr(0) + 'T00:00:00+07:00');
+    const row = await env.DB.prepare("SELECT COUNT(*) as count FROM dice_games WHERE status = 'finished' AND ended_ms >= ? AND ((host_id = ? AND host_rewarded = 1) OR (guest_id = ? AND guest_rewarded = 1))").bind(dayStart, userId, userId).first();
+    return row ? row.count : 0;
+}
+async function finishDiceGame(env, g, res) {
+    const now = Date.now(); const elapsed = now - (g.starts_ms || now);
+    const upd = await env.DB.prepare("UPDATE dice_games SET status = 'finished', ended_ms = ?, winner_id = ?, outcome = ?, reason = ? WHERE id = ? AND status = 'playing'").bind(now, res.winnerId || null, res.outcome, res.reason || '', g.id).run();
+    if (upd && upd.meta && upd.meta.changes === 0) return env.DB.prepare('SELECT * FROM dice_games WHERE id = ?').bind(g.id).first();
+    // host_rewarded / guest_rewarded: 1 = dapat hadiah, 0 = tidak, NEGATIF = jumlah trophy yang dikurangi (pihak kalah di game trophy)
+    let note = null, exp = 0, trophies = 0; const given = { host: 0, guest: 0 };
+    if (res.outcome === 'win') {
+        const versus = g.mode === 'versus'; const trophyGame = g.scope === 'global' && versus;
+        trophies = trophyGame ? RD_CFG.WIN_TROPHIES : 0;
+        exp = trophies ? 0 : (g.mode === 'solo' ? RD_CFG.WIN_EXP_SOLO : (versus ? RD_CFG.WIN_EXP_VERSUS : RD_CFG.WIN_EXP_COOP));
+        if (versus && elapsed < RD_CFG.MIN_VERSUS_MS) note = 'Game berakhir kurang dari 1 menit, jadi tidak dihitung (tanpa hadiah, trophy tidak berubah).';
+        else {
+            for (const uid of (versus ? [res.winnerId] : [g.host_id, g.guest_id])) {
+                if (!uid) continue;
+                if (await rdRewardedToday(env, uid) >= RD_CFG.MAX_REWARDED_PER_DAY) continue;
+                if (exp) await addReward(env, uid, 0, exp, 'random_dice_win');
+                if (trophies) await rdAddTrophies(env, uid, trophies);
+                if (uid === g.host_id) given.host = 1; else given.guest = 1;
+            }
+            if (trophyGame && res.winnerId) {      // yang kalah: trophy berkurang
+                const loserId = res.winnerId === g.host_id ? g.guest_id : g.host_id;
+                const lost = await rdTakeTrophies(env, loserId, RD_CFG.LOSE_TROPHIES);
+                if (loserId === g.host_id) given.host = -lost; else given.guest = -lost;
+            }
+        }
+    }
+    await env.DB.prepare('UPDATE dice_games SET note = ?, reward_exp = ?, reward_trophies = ?, host_rewarded = ?, guest_rewarded = ? WHERE id = ?').bind(note, exp, trophies, given.host, given.guest, g.id).run();
+    return env.DB.prepare('SELECT * FROM dice_games WHERE id = ?').bind(g.id).first();
+}
+// Perpindahan status "malas": dijalankan tiap kali game dibaca
+async function advanceDiceGame(env, g) {
+    const now = Date.now();
+    if (g.status === 'lobby' && now - g.created_ms > RD_CFG.LOBBY_TTL_MS) {
+        await env.DB.prepare("UPDATE dice_games SET status = 'cancelled', ended_ms = ? WHERE id = ? AND status = 'lobby'").bind(now, g.id).run();
+        g.status = 'cancelled'; return g;
+    }
+    if (g.status === 'picking' && now >= g.starts_ms) {
+        const hostDeck = rdValidDeck(rdParse(g.host_deck)) ? g.host_deck : JSON.stringify(rdRandomDeck());
+        const guestDeck = g.mode === 'solo' ? null : (rdValidDeck(rdParse(g.guest_deck)) ? g.guest_deck : JSON.stringify(rdRandomDeck()));
+        await env.DB.prepare("UPDATE dice_games SET status = 'playing', host_deck = ?, guest_deck = ?, host_seen = ?, guest_seen = ? WHERE id = ? AND status = 'picking'").bind(hostDeck, guestDeck, g.starts_ms, g.starts_ms, g.id).run();
+        g = await env.DB.prepare('SELECT * FROM dice_games WHERE id = ?').bind(g.id).first();
+    }
+    if (g.status === 'playing') {
+        if (now - g.starts_ms > RD_CFG.MAX_GAME_MS) return finishDiceGame(env, g, { outcome: 'draw', reason: 'timeout' });
+        const hostStale = now - (g.host_seen || g.starts_ms) > RD_CFG.STALE_MS, guestStale = now - (g.guest_seen || g.starts_ms) > RD_CFG.STALE_MS;
+        if (g.mode === 'solo') { if (hostStale) return finishDiceGame(env, g, { outcome: 'lose', reason: 'disconnect' }); return g; }
+        if (hostStale && guestStale) return finishDiceGame(env, g, { outcome: g.mode === 'versus' ? 'draw' : 'lose', reason: 'disconnect' });
+        if (g.mode === 'versus' && (hostStale || guestStale)) return finishDiceGame(env, g, { winnerId: hostStale ? g.guest_id : g.host_id, outcome: 'win', reason: 'disconnect' });
+    }
+    return g;
+}
+async function rdContext(env, user, scope) {
+    if (scope === 'global') return { scope: 'global' };
+    const room = await getCurrentCoupleRoom(env, user.id);
+    if (!room || room.status !== 'active') return { error: errorResponse('Random Dice pasangan dimainkan berdua. Buat atau masuk room pasangan dulu.', 400) };
+    return { scope: 'couple', room, partnerId: room.host_id === user.id ? room.partner_id : room.host_id };
+}
+async function rdFindGame(env, c, userId) {
+    const where = c.scope === 'global' ? "scope = 'global' AND (host_id = ? OR guest_id = ?)" : "scope = 'couple' AND room_id = ?";
+    const args = c.scope === 'global' ? [userId, userId] : [c.room.id];
+    let g = await env.DB.prepare(`SELECT * FROM dice_games WHERE ${where} AND status IN ${RD_ACTIVE} ORDER BY id DESC LIMIT 1`).bind(...args).first();
+    if (g) { g = await advanceDiceGame(env, g); if (g && g.status !== 'cancelled') return g; }
+    return env.DB.prepare(`SELECT * FROM dice_games WHERE ${where} AND status = 'finished' AND ended_ms > ? ORDER BY id DESC LIMIT 1`).bind(...args, Date.now() - RD_CFG.RESULT_TTL_MS).first();
+}
+function rdReasonText(g, viewerId, outcome) {
+    const r = g.reason; const other = g.scope === 'couple' ? 'Pasanganmu' : 'Pemain lain';
+    if (r === 'cleared') return 'Bos stage ' + RD_CFG.FINAL_STAGE + ' tumbang!';
+    if (r === 'lives') return g.mode === 'versus' ? (outcome === 'win' ? 'Lawanmu kehabisan nyawa' : 'Nyawamu habis') : 'Monster lolos — nyawa habis';
+    if (r === 'forfeit') return g.winner_id === viewerId ? other + ' keluar dari game' : 'Kamu keluar dari game';
+    if (r === 'disconnect') return g.mode === 'versus' && outcome === 'win' ? 'Lawan terputus' : 'Koneksi terputus terlalu lama';
+    if (r === 'timeout') return 'Batas waktu permainan habis';
+    return '';
+}
+async function composeDiceGame(env, g, viewerId) {
+    if (!g || g.status === 'cancelled') return null;
+    const isHost = g.host_id === viewerId; const otherId = isHost ? g.guest_id : g.host_id;
+    const partner = (otherId ? await getCoupleUserCard(env, otherId) : null) || {};
+    const side = (host) => ({ deck: rdParse(host ? g.host_deck : g.guest_deck), ready: (host ? g.host_ready : g.guest_ready) === 1, state: rdParse(host ? g.host_state : g.guest_state), present: host ? true : g.guest_joined === 1 });
+    let result = null;
+    if (g.status === 'finished') {
+        let outcome = g.outcome || 'lose';
+        if (g.mode === 'versus' && g.outcome === 'win') outcome = g.winner_id === viewerId ? 'win' : 'lose';
+        const mine = (isHost ? g.host_rewarded : g.guest_rewarded) || 0;
+        const rewarded = mine === 1;
+        result = {
+            outcome, reason: rdReasonText(g, viewerId, outcome), rewarded,
+            exp: rewarded ? (g.reward_exp || 0) : 0, trophies: rewarded ? (g.reward_trophies || 0) : 0,
+            trophiesLost: mine < 0 ? -mine : 0,
+            note: outcome === 'win' && !rewarded ? (g.note || 'Batas hadiah harian tercapai (maks ' + RD_CFG.MAX_REWARDED_PER_DAY + ' kemenangan berhadiah per hari).') : null
+        };
+    }
+    return {
+        id: g.id, scope: g.scope, code: g.code || null, status: g.status, mode: g.mode, seed: g.seed, hostId: g.host_id, startsAt: g.starts_ms, startedAt: g.starts_ms, endedAt: g.ended_ms,
+        me: { id: viewerId, isHost, ...side(isHost) }, partner: { ...partner, ...side(!isHost) }, result,
+        config: { pickSeconds: RD_CFG.PICK_MS / 1000, stageSec: RD_CFG.STAGE_SEC, finalStage: RD_CFG.FINAL_STAGE, winTrophies: RD_CFG.WIN_TROPHIES, loseTrophies: RD_CFG.LOSE_TROPHIES, winExpCoop: RD_CFG.WIN_EXP_COOP, winExpVersus: RD_CFG.WIN_EXP_VERSUS, winExpSolo: RD_CFG.WIN_EXP_SOLO }
+    };
+}
+// Chat game: pesan baru sejak id tertentu, lengkap dengan avatar, avatar border, dan level pengirim
+const RD_CHAT_SQL = `SELECT c.id, c.user_id, c.content, c.created_ms, u.username, u.display_name, u.avatar_url, u.level, u.is_verified,
+    (SELECT url FROM avatar_borders WHERE id = u.avatar_border_id) as border_url,
+    (SELECT scale FROM avatar_borders WHERE id = u.avatar_border_id) as border_scale,
+    (SELECT level_url FROM levels WHERE level_number = u.level) as level_url
+    FROM dice_chat c JOIN users u ON c.user_id = u.id WHERE c.game_id = ? AND c.id > ? ORDER BY c.id DESC LIMIT 30`;
+function rdChatMap(rows) {
+    return (rows || []).slice().reverse().map(m => ({ id: m.id, userId: m.user_id, username: m.username, displayName: m.display_name || m.username, avatarUrl: m.avatar_url, borderUrl: m.border_url, borderScale: m.border_scale || 1.2, level: m.level || 1, levelUrl: m.level_url, isVerified: m.is_verified === 1, content: m.content, at: m.created_ms }));
+}
+async function rdChatSince(env, gameId, after) {
+    const rows = await env.DB.prepare(RD_CHAT_SQL).bind(gameId, after || 0).all();
+    return rdChatMap(rows.results);
+}
+async function rdReply(env, c, g, user, opts = {}) {
+    const wantMe = c.scope === 'global' && !!opts.withMe;
+    const [game, chat, trophies] = await Promise.all([
+        composeDiceGame(env, g, user.id),
+        opts.chat !== undefined ? opts.chat : ((g && opts.chatAfter !== undefined) ? rdChatSince(env, g.id, opts.chatAfter) : undefined),
+        wantMe ? rdGetTrophies(env, user.id) : null
+    ]);
+    const data = { serverNow: Date.now(), game };
+    if (chat !== undefined) data.chat = chat;
+    if (wantMe) data.me = { ...trophies, ...rdSeasonInfo(), winTrophies: RD_CFG.WIN_TROPHIES, loseTrophies: RD_CFG.LOSE_TROPHIES, winExpSolo: RD_CFG.WIN_EXP_SOLO };
+    return successResponse(data, opts.message || 'Success');
+}
+// Ringkasan untuk halaman Pasangan (ajakan main)
+function rdSummaryFromRow(room, g, viewerId) {
+    if (!room || room.status !== 'active' || !g) return null;
+    return { id: g.id, status: g.status, mode: g.mode, invited: g.status === 'lobby' && g.host_id !== viewerId && g.guest_joined !== 1 };
+}
+async function rdSummaryForRoom(env, room, viewerId) {
+    try {
+        if (!room || room.status !== 'active') return null;
+        const g = await env.DB.prepare(`SELECT id, status, mode, host_id, guest_joined FROM dice_games WHERE scope = 'couple' AND room_id = ? AND status IN ${RD_ACTIVE} ORDER BY id DESC LIMIT 1`).bind(room.id).first();
+        return rdSummaryFromRow(room, g, viewerId);
+    } catch (e) { return null; }
+}
+async function rdBody(request) { try { return (await request.json()) || {}; } catch (e) { return {}; } }
+async function handleDiceGet(request, env, user, scope) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const c = await rdContext(env, user, scope); if (c.error) return c.error;
+        const after = new URL(request.url).searchParams.get('chatAfter');
+        return rdReply(env, c, await rdFindGame(env, c, user.id), user, { withMe: true, chatAfter: after === null ? undefined : (parseInt(after) || 0) });
+    } catch (e) { return errorResponse('Gagal memuat game: ' + dbHint(e), 500); }
+}
+async function handleDiceCreate(request, env, user, scope) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const c = await rdContext(env, user, scope); if (c.error) return c.error;
+        const body = await rdBody(request);
+        const mode = (c.scope === 'global' && body.mode === 'solo') ? 'solo' : (body.mode === 'versus' ? 'versus' : 'coop');
+        const existing = await rdFindGame(env, c, user.id);
+        if (existing && existing.status !== 'finished') return rdReply(env, c, existing, user, { withMe: true, message: 'Game sudah ada' });
+        const seed = Math.floor(Math.random() * 2147483647) + 1; let g;
+        if (mode === 'solo') {
+            // main sendiri: tanpa kode & tanpa lobi, langsung 30 detik memilih dadu
+            g = await env.DB.prepare("INSERT INTO dice_games (scope, host_id, status, mode, seed, created_ms, starts_ms) VALUES ('global', ?, 'picking', 'solo', ?, ?, ?) RETURNING *").bind(user.id, seed, Date.now(), Date.now() + RD_CFG.PICK_MS).first();
+        } else if (c.scope === 'global') {
+            let code = null;
+            for (let i = 0; i < 10; i++) {
+                const cd = generatePartyCode();
+                const dup = await env.DB.prepare(`SELECT id FROM dice_games WHERE code = ? AND status IN ${RD_ACTIVE}`).bind(cd).first();
+                if (!dup) { code = cd; break; }
+            }
+            if (!code) return errorResponse('Gagal membuat kode, coba lagi');
+            g = await env.DB.prepare("INSERT INTO dice_games (scope, code, host_id, status, mode, seed, created_ms) VALUES ('global', ?, ?, 'lobby', ?, ?, ?) RETURNING *").bind(code, user.id, mode, seed, Date.now()).first();
+        } else {
+            g = await env.DB.prepare("INSERT INTO dice_games (scope, room_id, host_id, guest_id, status, mode, seed, created_ms) VALUES ('couple', ?, ?, ?, 'lobby', ?, ?, ?) RETURNING *").bind(c.room.id, user.id, c.partnerId, mode, seed, Date.now()).first();
+            await notifyCoupleUser(env, c.partnerId, `🎲 *${coupleSenderName(user)}* mengajak main *Random Dice* (${mode === 'versus' ? 'mode Lawan' : 'mode Teman'}). Buka Room Pasangan untuk bergabung!`);
+        }
+        return rdReply(env, c, g, user, { withMe: true, message: 'Room dibuat. Menunggu pemain lain…' });
+    } catch (e) { return errorResponse('Gagal membuat game: ' + dbHint(e), 500); }
+}
+async function handleDiceJoin(request, env, user, scope) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const c = await rdContext(env, user, scope); if (c.error) return c.error;
+        const body = await rdBody(request); let g;
+        if (c.scope === 'global') {
+            const code = String(body.code || '').trim().toUpperCase();
+            if (!code) return errorResponse('Kode room wajib diisi');
+            const mine = await rdFindGame(env, c, user.id);
+            if (mine && mine.status !== 'finished') {
+                if (mine.code === code) return rdReply(env, c, mine, user, { withMe: true });
+                return errorResponse('Kamu masih punya game lain. Selesaikan atau keluar dulu.', 400);
+            }
+            g = await env.DB.prepare(`SELECT * FROM dice_games WHERE scope = 'global' AND code = ? AND status IN ${RD_ACTIVE} ORDER BY id DESC LIMIT 1`).bind(code).first();
+            if (!g) return errorResponse('Room tidak ditemukan atau sudah berakhir', 404);
+            if (g.status !== 'lobby' || g.guest_id) return errorResponse('Room ini sudah penuh', 400);
+            const upd = await env.DB.prepare("UPDATE dice_games SET guest_id = ?, guest_joined = 1, status = 'picking', starts_ms = ? WHERE id = ? AND status = 'lobby' AND guest_id IS NULL").bind(user.id, Date.now() + RD_CFG.PICK_MS, g.id).run();
+            if (upd && upd.meta && upd.meta.changes === 0) return errorResponse('Room ini sudah penuh', 400);
+        } else {
+            g = await rdFindGame(env, c, user.id);
+            if (!g || g.status === 'finished') return errorResponse('Tidak ada lobi game. Buat dulu.', 404);
+            if (g.status === 'lobby' && g.guest_id === user.id) await env.DB.prepare("UPDATE dice_games SET guest_joined = 1, status = 'picking', starts_ms = ? WHERE id = ? AND status = 'lobby'").bind(Date.now() + RD_CFG.PICK_MS, g.id).run();
+        }
+        g = await env.DB.prepare('SELECT * FROM dice_games WHERE id = ?').bind(g.id).first();
+        return rdReply(env, c, g, user, { withMe: true });
+    } catch (e) { return errorResponse('Gagal bergabung: ' + dbHint(e), 500); }
+}
+async function handleDicePick(request, env, user, scope) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const c = await rdContext(env, user, scope); if (c.error) return c.error;
+        let g = await rdFindGame(env, c, user.id);
+        if (!g || g.status !== 'picking') return rdReply(env, c, g, user);
+        const body = await rdBody(request); const isHost = g.host_id === user.id; const col = isHost ? 'host' : 'guest';
+        if (g.mode !== 'solo' && (body.mode === 'versus' || body.mode === 'coop') && body.mode !== g.mode) await env.DB.prepare("UPDATE dice_games SET mode = ?, host_ready = 0, guest_ready = 0 WHERE id = ? AND status = 'picking'").bind(body.mode, g.id).run();
+        if (body.deck !== undefined) {
+            if (!rdValidDeck(body.deck)) return errorResponse('Pilih tepat 5 dadu yang berbeda', 400);
+            await env.DB.prepare(`UPDATE dice_games SET ${col}_deck = ? WHERE id = ? AND status = 'picking'`).bind(JSON.stringify(body.deck), g.id).run();
+        }
+        g = await env.DB.prepare('SELECT * FROM dice_games WHERE id = ?').bind(g.id).first();
+        if (body.ready === true && rdValidDeck(rdParse(isHost ? g.host_deck : g.guest_deck))) {
+            await env.DB.prepare(`UPDATE dice_games SET ${col}_ready = 1 WHERE id = ? AND status = 'picking'`).bind(g.id).run();
+            g = await env.DB.prepare('SELECT * FROM dice_games WHERE id = ?').bind(g.id).first();
+            // keduanya siap: tidak perlu menunggu 30 detik penuh
+            if (g.host_ready === 1 && (g.mode === 'solo' || g.guest_ready === 1) && g.starts_ms - Date.now() > RD_CFG.READY_START_MS) {
+                await env.DB.prepare("UPDATE dice_games SET starts_ms = ? WHERE id = ? AND status = 'picking'").bind(Date.now() + RD_CFG.READY_START_MS, g.id).run();
+                g = await env.DB.prepare('SELECT * FROM dice_games WHERE id = ?').bind(g.id).first();
+            }
+        }
+        return rdReply(env, c, g, user);
+    } catch (e) { return errorResponse('Gagal menyimpan pilihan: ' + dbHint(e), 500); }
+}
+async function handleDiceSync(request, env, user, scope) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const body = await rdBody(request); const now = Date.now();
+        const st = rdCleanState(body.state); const gameId = Number(body.gameId) || 0;
+        const chatAfter = typeof body.chatAfter === 'number' ? body.chatAfter : undefined;
+        if (st && gameId) {
+            // Jalur cepat (dipanggil tiap 1,5 detik per pemain): simpan status + ambil chat dalam SATU panggilan D1.
+            // UPDATE hanya mengenai kolom milik pengirim, dan hanya bila ia memang pemain di game itu.
+            const json = JSON.stringify(st), uid = user.id;
+            const stmts = [env.DB.prepare(
+                `UPDATE dice_games SET
+                 host_state = CASE WHEN host_id = ? THEN ? ELSE host_state END, host_seen = CASE WHEN host_id = ? THEN ? ELSE host_seen END,
+                 guest_state = CASE WHEN guest_id = ? THEN ? ELSE guest_state END, guest_seen = CASE WHEN guest_id = ? THEN ? ELSE guest_seen END
+                 WHERE id = ? AND scope = ? AND status = 'playing' AND (host_id = ? OR guest_id = ?) RETURNING *`
+            ).bind(uid, json, uid, now, uid, json, uid, now, gameId, scope, uid, uid)];
+            if (chatAfter !== undefined) stmts.push(env.DB.prepare(RD_CHAT_SQL).bind(gameId, chatAfter));
+            const res = await env.DB.batch(stmts);
+            let g = (res[0].results || [])[0] || null;
+            if (g) {
+                const otherId = g.host_id === uid ? g.guest_id : g.host_id;
+                if (!st.alive) g = await finishDiceGame(env, g, g.mode === 'versus' ? { winnerId: otherId, outcome: 'win', reason: 'lives' } : { outcome: 'lose', reason: 'lives' });
+                else if (st.cleared && g.mode !== 'versus' && now - g.starts_ms >= (RD_CFG.START_DELAY + (RD_CFG.FINAL_STAGE - 1) * RD_CFG.STAGE_SEC) * 1000) g = await finishDiceGame(env, g, { outcome: 'win', reason: 'cleared' });
+                else g = await advanceDiceGame(env, g);
+                return rdReply(env, { scope }, g, user, { chat: res[1] ? rdChatMap(res[1].results) : undefined, withMe: g.status === 'finished' });
+            }
+        }
+        // Game sudah selesai / belum mulai / bukan pemainnya: jalur biasa
+        const c = await rdContext(env, user, scope); if (c.error) return c.error;
+        const g = await rdFindGame(env, c, user.id);
+        return rdReply(env, c, g, user, { chatAfter, withMe: !!(g && g.status === 'finished') });
+    } catch (e) { return errorResponse('Gagal sinkron: ' + dbHint(e), 500); }
+}
+async function handleDiceLeave(request, env, user, scope) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const c = await rdContext(env, user, scope); if (c.error) return c.error;
+        let g = await rdFindGame(env, c, user.id);
+        if (!g || g.status === 'finished') return rdReply(env, c, null, user, { withMe: true });
+        const otherId = g.host_id === user.id ? g.guest_id : g.host_id;
+        if (g.status === 'playing') g = await finishDiceGame(env, g, g.mode === 'versus' ? { winnerId: otherId, outcome: 'win', reason: 'forfeit' } : { winnerId: otherId, outcome: 'lose', reason: 'forfeit' });
+        else { await env.DB.prepare(`UPDATE dice_games SET status = 'cancelled', ended_ms = ? WHERE id = ? AND status IN ('lobby', 'picking')`).bind(Date.now(), g.id).run(); g = null; }
+        return rdReply(env, c, g, user, { withMe: true, message: 'Keluar dari game' });
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
+}
+async function handleDiceChat(request, env, user, scope) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const c = await rdContext(env, user, scope); if (c.error) return c.error;
+        const g = await rdFindGame(env, c, user.id);
+        if (!g) return errorResponse('Tidak ada game untuk chat', 404);
+        const body = await rdBody(request); const content = String(body.content || '').trim().slice(0, RD_CFG.CHAT_MAX);
+        if (!content) return errorResponse('Pesan kosong');
+        const now = Date.now();
+        const recent = await env.DB.prepare('SELECT COUNT(*) as count FROM dice_chat WHERE game_id = ? AND user_id = ? AND created_ms > ?').bind(g.id, user.id, now - 10000).first();
+        if (recent && recent.count >= 8) return errorResponse('Terlalu cepat. Tunggu sebentar ya.', 429);
+        await env.DB.prepare('INSERT INTO dice_chat (game_id, user_id, content, created_ms) VALUES (?, ?, ?, ?)').bind(g.id, user.id, content, now).run();
+        return rdReply(env, c, g, user, { chatAfter: Number(body.chatAfter) || 0 });
+    } catch (e) { return errorResponse('Gagal mengirim pesan: ' + dbHint(e), 500); }
+}
+// Leaderboard trophy musim ini (Random Dice global, mode Lawan)
+async function handleTrophyLeaderboard(request, env, user) {
+    try {
+        const url = new URL(request.url); const info = rdSeasonInfo();
+        const page = Math.max(1, parseInt(url.searchParams.get('page') || '1')); const limit = 20, offset = (page - 1) * limit;
+        const rows = await env.DB.prepare(
+            `SELECT t.user_id, t.trophies, t.wins, u.username, u.display_name, u.avatar_url, u.level, u.is_verified,
+             (SELECT url FROM avatar_borders WHERE id = u.avatar_border_id) as border_url,
+             (SELECT scale FROM avatar_borders WHERE id = u.avatar_border_id) as border_scale
+             FROM dice_trophies t JOIN users u ON t.user_id = u.id WHERE t.season = ? AND t.trophies > 0
+             ORDER BY t.trophies DESC, t.wins DESC, t.user_id ASC LIMIT ? OFFSET ?`
+        ).bind(info.season, limit, offset).all();
+        const total = await env.DB.prepare('SELECT COUNT(*) as count FROM dice_trophies WHERE season = ? AND trophies > 0').bind(info.season).first();
+        const count = total ? total.count : 0; let mine = null;
+        if (user) {
+            const t = await rdGetTrophies(env, user.id); let rank = null;
+            if (t.trophies > 0) {
+                const ahead = await env.DB.prepare('SELECT COUNT(*) as count FROM dice_trophies WHERE season = ? AND (trophies > ? OR (trophies = ? AND (wins > ? OR (wins = ? AND user_id < ?))))').bind(info.season, t.trophies, t.trophies, t.wins, t.wins, user.id).first();
+                rank = (ahead ? ahead.count : 0) + 1;
+            }
+            mine = { rank, trophies: t.trophies, wins: t.wins, ...((await getCoupleUserCard(env, user.id)) || {}) };
+        }
+        return successResponse({
+            ...info, total: count, page, totalPages: Math.ceil(count / limit), mine,
+            users: (rows.results || []).map((r, i) => ({ rank: offset + i + 1, id: r.user_id, username: r.username, displayName: r.display_name || r.username, avatarUrl: r.avatar_url, borderUrl: r.border_url, borderScale: r.border_scale || 1.2, level: r.level || 1, isVerified: r.is_verified === 1, trophies: r.trophies, wins: r.wins }))
+        });
+    } catch (e) { return errorResponse('Gagal memuat leaderboard trophy: ' + dbHint(e), 500); }
+}
+
+// ============================================================
+// MENGIKUTI / PENGIKUT (ala Instagram)
+// ============================================================
+async function getFollowInfo(env, userId, viewerId) {
+    try {
+        const v = viewerId || 0;
+        const r = await env.DB.prepare(
+            `SELECT (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers, (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following,
+             (SELECT COUNT(*) FROM follows WHERE follower_id = ? AND following_id = ?) as is_following, (SELECT COUNT(*) FROM follows WHERE follower_id = ? AND following_id = ?) as follows_me`
+        ).bind(userId, userId, v, userId, userId, v).first();
+        return { followersCount: r.followers || 0, followingCount: r.following || 0, isFollowing: r.is_following > 0, followsMe: r.follows_me > 0 };
+    } catch (e) { return { followersCount: 0, followingCount: 0, isFollowing: false, followsMe: false }; }
+}
+async function getFollowingSet(env, viewer) {
+    try { if (!viewer) return new Set(); const rows = await env.DB.prepare('SELECT following_id FROM follows WHERE follower_id = ?').bind(viewer.id).all(); return new Set((rows.results || []).map(r => r.following_id)); }
+    catch (e) { return new Set(); }
+}
+async function handleFollowUser(request, env, user, targetId, follow) {
+    if (!user) return errorResponse('Login untuk mengikuti', 401);
+    try {
+        const id = parseInt(targetId);
+        if (id === user.id) return errorResponse('Tidak bisa mengikuti diri sendiri', 400);
+        const target = await env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(id).first();
+        if (!target) return errorResponse('User tidak ditemukan', 404);
+        if (follow) await env.DB.prepare('INSERT OR IGNORE INTO follows (follower_id, following_id, created_at) VALUES (?, ?, ?)').bind(user.id, id, new Date().toISOString()).run();
+        else await env.DB.prepare('DELETE FROM follows WHERE follower_id = ? AND following_id = ?').bind(user.id, id).run();
+        const info = await getFollowInfo(env, id, user.id);
+        return successResponse({ userId: id, following: info.isFollowing, followersCount: info.followersCount, followsMe: info.followsMe }, follow ? 'Mengikuti' : 'Berhenti mengikuti');
+    } catch (e) { return errorResponse('Gagal: ' + dbHint(e), 500); }
+}
+async function handleFollowList(request, env, viewer, username, type) {
+    try {
+        const owner = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(username).first();
+        if (!owner) return errorResponse('User tidak ditemukan', 404);
+        const page = Math.max(1, parseInt(new URL(request.url).searchParams.get('page') || '1')); const limit = 30, offset = (page - 1) * limit;
+        const join = type === 'followers' ? 'f.follower_id = u.id WHERE f.following_id = ?' : 'f.following_id = u.id WHERE f.follower_id = ?';
+        const rows = await env.DB.prepare(
+            `SELECT u.id, u.username, u.display_name, u.avatar_url, u.level, u.is_verified,
+             (SELECT url FROM avatar_borders WHERE id = u.avatar_border_id) as border_url,
+             (SELECT scale FROM avatar_borders WHERE id = u.avatar_border_id) as border_scale,
+             (SELECT COUNT(*) FROM follows v WHERE v.follower_id = ? AND v.following_id = u.id) as viewer_follows
+             FROM follows f JOIN users u ON ${join} ORDER BY f.created_at DESC LIMIT ? OFFSET ?`
+        ).bind(viewer ? viewer.id : 0, owner.id, limit, offset).all();
+        const total = await env.DB.prepare(`SELECT COUNT(*) as count FROM follows WHERE ${type === 'followers' ? 'following_id' : 'follower_id'} = ?`).bind(owner.id).first();
+        const count = total ? total.count : 0;
+        return successResponse({
+            type, total: count, page, totalPages: Math.ceil(count / limit),
+            users: (rows.results || []).map(u => ({ id: u.id, username: u.username, displayName: u.display_name || u.username, avatarUrl: u.avatar_url, borderUrl: u.border_url, borderScale: u.border_scale || 1.2, level: u.level || 1, isVerified: u.is_verified === 1, isFollowing: u.viewer_follows > 0, isSelf: !!viewer && viewer.id === u.id }))
+        });
+    } catch (e) { return errorResponse('Gagal memuat daftar: ' + dbHint(e), 500); }
+}
+
+// ============================================================
+// TOP UP KOIN DENGAN TELEGRAM STARS (mata uang XTR)
+// Alur: createInvoiceLink -> Mini App openInvoice -> bot menerima pre_checkout_query
+// (wajib dijawab) -> bot menerima successful_payment -> koin ditambahkan.
+// ============================================================
+const STAR_PACKAGES = [
+    { id: 'k1000', koin: 1000, stars: 3 },
+    { id: 'k5000', koin: 5000, stars: 15 },
+    { id: 'k10000', koin: 10000, stars: 30 }
+];
+async function handleGetTopupPackages(request, env, user) { return successResponse({ packages: STAR_PACKAGES, available: !!env.TELEGRAM_BOT_TOKEN }); }
+async function handleCreateStarsInvoice(request, env, user) {
+    if (!user) return errorResponse('Login untuk top up', 401);
+    try {
+        if (!env.TELEGRAM_BOT_TOKEN) return errorResponse('Bot Telegram belum dikonfigurasi', 500);
+        let body = {}; try { body = await request.json(); } catch (e) {}
+        const pkg = STAR_PACKAGES.find(p => p.id === body.packageId);
+        if (!pkg) return errorResponse('Paket tidak ditemukan', 400);
+        const payload = 'topup_' + generateToken(12);
+        const order = await env.DB.prepare("INSERT INTO star_payments (user_id, package_id, koin, stars, payload, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?) RETURNING id").bind(user.id, pkg.id, pkg.koin, pkg.stars, payload, new Date().toISOString()).first();
+        const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/createInvoiceLink`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: `${formatKoin(pkg.koin)} Koin Fesstale`, description: `Top up ${formatKoin(pkg.koin)} koin untuk akun @${user.username}`, payload, provider_token: '', currency: 'XTR', prices: [{ label: `${formatKoin(pkg.koin)} Koin`, amount: pkg.stars }] })
+        });
+        const data = await res.json();
+        if (!data.ok || !data.result) return errorResponse('Gagal membuat tagihan Telegram Stars: ' + (data.description || 'tidak diketahui'), 502);
+        return successResponse({ orderId: order.id, invoiceLink: data.result, koin: pkg.koin, stars: pkg.stars });
+    } catch (e) { return errorResponse('Gagal membuat tagihan: ' + dbHint(e), 500); }
+}
+async function handleStarsOrderStatus(request, env, user) {
+    if (!user) return errorResponse('Login required', 401);
+    try {
+        const orderId = parseInt(new URL(request.url).searchParams.get('orderId') || '0');
+        const order = await env.DB.prepare('SELECT id, status, koin, stars FROM star_payments WHERE id = ? AND user_id = ?').bind(orderId, user.id).first();
+        if (!order) return errorResponse('Tagihan tidak ditemukan', 404);
+        const u = await env.DB.prepare('SELECT koin FROM users WHERE id = ?').bind(user.id).first();
+        return successResponse({ status: order.status, added: order.koin, stars: order.stars, koin: u ? u.koin : 0 });
+    } catch (e) { return errorResponse('Gagal memeriksa tagihan', 500); }
+}
+// Telegram menunggu jawaban maksimal 10 detik; tagihan yang tidak dikenal ditolak
+async function handleStarsPreCheckout(env, q) {
+    let ok = false, errorMessage = 'Tagihan tidak valid atau sudah kedaluwarsa.';
+    try {
+        const order = await env.DB.prepare('SELECT * FROM star_payments WHERE payload = ?').bind(String(q.invoice_payload || '')).first();
+        if (order && order.status === 'pending' && q.currency === 'XTR' && Number(q.total_amount) === order.stars) ok = true;
+        else if (order && order.status === 'paid') errorMessage = 'Tagihan ini sudah dibayar.';
+    } catch (e) {}
+    try {
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerPreCheckoutQuery`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(ok ? { pre_checkout_query_id: q.id, ok: true } : { pre_checkout_query_id: q.id, ok: false, error_message: errorMessage })
+        });
+    } catch (e) {}
+}
+async function handleStarsSuccessfulPayment(env, message) {
+    try {
+        const sp = message.successful_payment;
+        const order = await env.DB.prepare('SELECT * FROM star_payments WHERE payload = ?').bind(String(sp.invoice_payload || '')).first();
+        if (!order) return;
+        // tandai lunas secara atomik supaya koin tidak masuk dua kali bila Telegram mengirim ulang
+        const upd = await env.DB.prepare("UPDATE star_payments SET status = 'paid', telegram_charge_id = ?, paid_at = ? WHERE id = ? AND status = 'pending'").bind(sp.telegram_payment_charge_id || null, new Date().toISOString(), order.id).run();
+        if (upd && upd.meta && upd.meta.changes === 0) return;
+        await env.DB.prepare('UPDATE users SET koin = koin + ?, updated_at = datetime("now") WHERE id = ?').bind(order.koin, order.user_id).run();
+        await env.DB.prepare('INSERT INTO transactions (user_id, type, amount, source, created_at) VALUES (?, ?, ?, ?, datetime("now"))').bind(order.user_id, 'earn', order.koin, 'topup_stars').run();
+        await sendTelegramMessage(env, message.chat.id, `✅ *Top up berhasil!*\n\n+${formatKoin(order.koin)} koin sudah masuk ke akunmu (${order.stars} ⭐).`);
+    } catch (e) { console.error('Stars payment error:', e); }
+}
+
+// Beranda dalam SATU request: menggabungkan 5–7 endpoint yang sebelumnya dipanggil terpisah oleh aplikasi.
+// Unduhan gambar (kartu streak) untuk Telegram.WebApp.downloadFile: meneruskan gambar dari Gyazo dengan header "attachment".
+// Hanya menerima alamat gambar i.gyazo.com supaya tidak menjadi proxy terbuka.
+async function handleDownloadImage(request) {
+    try {
+        const url = new URL(request.url); const src = url.searchParams.get('src') || '';
+        if (!/^https:\/\/i\.gyazo\.com\/[A-Za-z0-9]+\.(jpg|jpeg|png|webp|gif)$/i.test(src)) return errorResponse('Sumber gambar tidak diizinkan', 400);
+        const name = (url.searchParams.get('name') || 'gambar.jpg').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 60) || 'gambar.jpg';
+        const upstream = await fetch(src);
+        const type = upstream.headers.get('Content-Type') || '';
+        if (!upstream.ok || !type.startsWith('image/')) return errorResponse('Gambar tidak ditemukan', 404);
+        return new Response(upstream.body, { headers: { 'Content-Type': type, 'Content-Disposition': `attachment; filename="${name}"`, 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'private, max-age=300' } });
+    } catch (e) { return errorResponse('Gagal mengunduh gambar', 502); }
+}
+
+async function handleGetHome(request, env, user) {
+    try {
+        const url = new URL(request.url);
+        const page = Math.max(1, parseInt(url.searchParams.get('page') || '1') || 1);
+        const sub = (path) => new Request(url.origin + path, { headers: request.headers });
+        const tasks = {
+            notes: handleGetNotes(sub('/api/notes'), env, user),
+            featured: handleGetFeaturedContent(sub('/api/featured'), env),
+            trending: handleGetTrendingContent(sub('/api/trending?limit=20'), env),
+            latest: handleGetManualContent(sub('/api/content?sort=latest&page=' + page + '&limit=20'), env),
+            popular: handleGetManualContent(sub('/api/content?sort=popular&page=1&limit=10'), env)
+        };
+        if (user) {
+            tasks.recent = handleGetRecentlyWatched(sub('/api/recently-watched'), env, user);
+            tasks.recommendations = handleGetRecommendations(sub('/api/recommendations'), env, user);
+        }
+        const keys = Object.keys(tasks);
+        const parts = await Promise.all(keys.map((k) => Promise.resolve(tasks[k]).then((r) => r.json()).catch(() => ({ success: false, error: 'Gagal memuat' }))));
+        const data = {}; keys.forEach((k, i) => { data[k] = parts[i]; });
+        return successResponse(data);
+    } catch (e) { return errorResponse('Gagal memuat beranda', 500); }
+}
+
 async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -3303,6 +4121,8 @@ async function handleRequest(request, env, ctx) {
 
     // LEADERBOARD / NOTES / STATS / FEATURED / STORY COUNT
     if (path === '/api/leaderboard' && method === 'GET') return handleGetLeaderboard(request, env, user);
+    if (path === '/api/download-image' && method === 'GET') return handleDownloadImage(request);
+    if (path === '/api/home' && method === 'GET') return handleGetHome(request, env, user);
     if (path === '/api/notes' && method === 'GET') return handleGetNotes(request, env, user);
     if (path === '/api/stats' && method === 'GET') return handleGetStats(request, env);
     if (path === '/api/stats/story-count' && method === 'GET') return handleGetStoryCount(request, env);
@@ -3404,6 +4224,42 @@ async function handleRequest(request, env, ctx) {
 
     if (path === '/api/vouchers/redeem' && method === 'POST') return handleRedeemVoucher(request, env, user);
 
+    // PASANGAN + STREAK
+    if (path === '/api/couple' && method === 'GET') return handleGetCouple(request, env, user);
+    if (path === '/api/couple' && method === 'DELETE') return handleEndCouple(request, env, user);
+    if (path === '/api/couple/create' && method === 'POST') return handleCreateCouple(request, env, user);
+    if (path === '/api/couple/join' && method === 'POST') return handleJoinCouple(request, env, user);
+    if (path === '/api/couple/checkin' && method === 'POST') return handleCoupleCheckin(request, env, user);
+    if (path === '/api/couple/leaderboard' && method === 'GET') return handleCoupleLeaderboard(request, env, user);
+
+    // RANDOM DICE: /api/couple/game* (pasangan) dan /api/dice* (global, room berkode)
+    const diceRoute = path.match(/^\/api\/(couple\/game|dice)(?:\/(create|join|pick|sync|leave|chat|leaderboard))?$/);
+    if (diceRoute) {
+        const diceScope = diceRoute[1] === 'dice' ? 'global' : 'couple'; const diceAction = diceRoute[2] || '';
+        if (!diceAction && method === 'GET') return handleDiceGet(request, env, user, diceScope);
+        if (diceAction === 'leaderboard' && method === 'GET' && diceScope === 'global') return handleTrophyLeaderboard(request, env, user);
+        if (method === 'POST' && diceAction === 'create') return handleDiceCreate(request, env, user, diceScope);
+        if (method === 'POST' && diceAction === 'join') return handleDiceJoin(request, env, user, diceScope);
+        if (method === 'POST' && diceAction === 'pick') return handleDicePick(request, env, user, diceScope);
+        if (method === 'POST' && diceAction === 'sync') return handleDiceSync(request, env, user, diceScope);
+        if (method === 'POST' && diceAction === 'leave') return handleDiceLeave(request, env, user, diceScope);
+        if (method === 'POST' && diceAction === 'chat') return handleDiceChat(request, env, user, diceScope);
+    }
+
+    // MENGIKUTI / PENGIKUT
+    const followMatch = path.match(/^\/api\/follow\/(\d+)$/);
+    if (followMatch && (method === 'POST' || method === 'DELETE')) return handleFollowUser(request, env, user, followMatch[1], method === 'POST');
+    const followListMatch = path.match(/^\/api\/user\/([a-zA-Z0-9_]+)\/(followers|following)$/);
+    if (followListMatch && method === 'GET') return handleFollowList(request, env, user, followListMatch[1], followListMatch[2]);
+
+    // TOP UP KOIN (TELEGRAM STARS)
+    if (path === '/api/topup/packages' && method === 'GET') return handleGetTopupPackages(request, env, user);
+    if (path === '/api/topup/stars' && method === 'POST') return handleCreateStarsInvoice(request, env, user);
+    if (path === '/api/topup/stars/status' && method === 'GET') return handleStarsOrderStatus(request, env, user);
+
+    // PENCARIAN USER
+    if (path === '/api/users/search' && method === 'GET') return handleSearchUsers(request, env, user);
+
     // ROOM PARTY
     if (path === '/api/party/rooms' && method === 'GET') return handleListPartyRooms(request, env, user);
     if (path === '/api/party/create' && method === 'POST') return handleCreateParty(request, env, user);
@@ -3500,6 +4356,9 @@ async function handleRequest(request, env, ctx) {
 
 export default {
     async fetch(request, env, ctx) {
-        return handleRequest(request, env, ctx);
+        const response = await handleRequest(request, env, ctx);
+        // pengaturan diubah lewat panel admin → buang cache pengaturan di isolate ini
+        if (request.method !== 'GET' && request.url.indexOf('/api/admin') !== -1) invalidateSettingsCache();
+        return response;
     }
 };
